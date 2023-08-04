@@ -1,0 +1,408 @@
+package logverbosity
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+
+	"github.com/spf13/cobra"
+
+	"k8s.io/client-go/tools/clientcmd"
+
+	k8smetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	v1 "kubevirt.io/api/core/v1"
+	"kubevirt.io/client-go/kubecli"
+
+	"kubevirt.io/kubevirt/pkg/apimachinery/patch"
+	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
+	"kubevirt.io/kubevirt/pkg/virtctl/templates"
+)
+
+type Command struct {
+	clientConfig clientcmd.ClientConfig
+	command      string
+}
+
+// for command parsing
+const (
+	// Verbosity must be 0-9.
+	// https://kubernetes.io/docs/reference/kubectl/cheatsheet/#kubectl-output-verbosity-and-debugging
+	minVerbosity = uint(0)
+	maxVerbosity = uint(9)
+	// Any number between 10 and MaxUint is fine.
+	// We select less weird numbers, because these numbers will be shown in the help menu.
+	// There is no option to hide the default value from the help menu.
+	// See pflag.FlagUsages, which calls the FlagUsagesWrapped function:
+	// https://github.com/kubevirt/kubevirt/blob/main/vendor/github.com/spf13/pflag/flag.go#L677
+	noArg        = 10    // Default value if no argument specified (e.g. "--virt-api=10" = "--virt-api")
+	NoFlag       = 11    // Default value if no flag is specified
+	allComponent = "all" // Use in multiple places, so make it a constant
+)
+
+// for receiving the flag argument
+var isReset bool
+
+// Log verbosity can be set per KubeVirt component.
+// https://kubevirt.io/user-guide/operations/debug/#setting-verbosity-per-kubevirt-component
+// TODO: set verbosity per nodes
+var virtComponents = map[string]*uint{
+	"virt-api":        new(uint),
+	"virt-controller": new(uint),
+	"virt-handler":    new(uint),
+	"virt-launcher":   new(uint),
+	"virt-operator":   new(uint),
+	"all":             new(uint),
+}
+
+// operation type of log-verbosity command
+type operation int
+
+const (
+	show operation = iota
+	set
+	nop
+)
+
+// for patch operation
+const (
+	// Just "add" is fine, no need of "replace" and "remove".
+	// https://www.rfc-editor.org/rfc/rfc6902
+	patchOperation = patch.PatchAddOp
+	patchPath      = "/spec/configuration/developerConfiguration/logVerbosity"
+)
+
+func NewCommand(clientConfig clientcmd.ClientConfig) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "log-verbosity",
+		Short: "Show or Set/Reset log verbosity. The verbosity must be 0-9. Show and Set/Reset cannot coexist.\n",
+		Long: "- To show the log verbosity of one or more components " +
+			"(when the log verbosity is unattended in the KubeVirt CR, show the default verbosity (2)).\n" +
+			"- To set the log verbosity of one or more components.\n" +
+			"- To reset the log verbosity of all components " +
+			"(empty the log verbosity field, which means reset to the default verbosity (2)).\n\n" +
+			"- The components are <virt-api|virt-controller|virt-handler|virt-launcher|virt-operator>.\n" +
+			"- Show and Set/Reset cannot coexist.\n" +
+			"- Verbosity must be 0-9.\n" +
+			"- The Show command internally sets verbosity to 10. So if you set verbosity to 10, it will be interpreted as the show command " +
+			"(e.g. \"virt-api=10\" = \"virt-api\").\n" +
+			"- Flag syntax must be \"flag=arg\" (\"flag arg\" not supported).",
+		Example: usage(),
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			c := Command{command: "log-verbosity", clientConfig: clientConfig}
+			return c.RunE(cmd)
+		},
+	}
+
+	cmd.Flags().UintVar(virtComponents["virt-api"], "virt-api", NoFlag, "show/set virt-api log verbosity (0-9)")
+	// Set default value (noArg) if the flag has no argument, because we use the flag without an argument (e.g. --virt-api) to show verbosity.
+	// Otherwise, the pflag package will return an error due to missing argument.
+	cmd.Flags().Lookup("virt-api").NoOptDefVal = strconv.FormatUint(noArg, 10)
+
+	cmd.Flags().UintVar(virtComponents["virt-controller"], "virt-controller", NoFlag, "show/set virt-controller log verbosity (0-9)")
+	cmd.Flags().Lookup("virt-controller").NoOptDefVal = strconv.FormatUint(noArg, 10)
+
+	cmd.Flags().UintVar(virtComponents["virt-handler"], "virt-handler", NoFlag, "show/set virt-handler log verbosity (0-9)")
+	cmd.Flags().Lookup("virt-handler").NoOptDefVal = strconv.FormatUint(noArg, 10)
+
+	cmd.Flags().UintVar(virtComponents["virt-launcher"], "virt-launcher", NoFlag, "show/set virt-launcher log verbosity (0-9)")
+	cmd.Flags().Lookup("virt-launcher").NoOptDefVal = strconv.FormatUint(noArg, 10)
+
+	cmd.Flags().UintVar(virtComponents["virt-operator"], "virt-operator", NoFlag, "show/set virt-operator log verbosity (0-9)")
+	cmd.Flags().Lookup("virt-operator").NoOptDefVal = strconv.FormatUint(noArg, 10)
+
+	cmd.Flags().UintVar(virtComponents["all"], "all", NoFlag, "show/set all component log verbosity (0-9)")
+	cmd.Flags().Lookup("all").NoOptDefVal = strconv.FormatUint(noArg, 10)
+
+	cmd.Flags().BoolVar(&isReset, "reset", false, "reset log verbosity to the default verbosity (2) (empty the log verbosity)")
+
+	// cannot specify "reset" and "all" flag at the same time
+	cmd.MarkFlagsMutuallyExclusive("reset", "all")
+
+	cmd.SetUsageTemplate(templates.UsageTemplate())
+	return cmd
+}
+
+// Command line flag syntax:
+//
+//	OK: --flag=x
+//	NG: --flag x
+//
+// A flag without an argument should only be used for boolean flags.
+// However, we want to use a flag without an argument (e.g. --virt-api) to show verbosity.
+// To do this, we set the default value (NoOptDefVal) when the flag has no argument.
+// In this case, we cannot use the "--flag x" syntax, because "--flag x" only applies to flags without a default value.
+// See vendor/github.com/spf13/pflag/flag.go, especially note the order of the if clause below.
+// https://github.com/kubevirt/kubevirt/blob/main/vendor/github.com/spf13/pflag/flag.go#L983C1-L998C3
+func usage() string {
+	usage := "  # reset (to default) log-verbosity for all components\n"
+	usage += "  {{ProgramName}} adm logVerbosity --reset\n"
+
+	usage += "  # show log-verbosity for all components:\n"
+	usage += "  {{ProgramName}} adm log-verbosity --all\n"
+	usage += "  # set log-verbosity to 3 for all components:\n"
+	usage += "  {{ProgramName}} adm log-verbosity --all=3\n"
+
+	usage += "  # show log-verbosity for virt-handler:\n"
+	usage += "  {{ProgramName}} adm log-verbosity --virt-handler\n"
+	usage += "  # set log-verbosity to 7 for virt-handler:\n"
+	usage += "  {{ProgramName}} adm log-verbosity --virt-handler=7\n"
+
+	usage += "  # show log-verbosity for virt-handler and virt-launcher\n"
+	usage += "  {{ProgramName}} adm log-verbosity --virt-handler --virt-launcher\n"
+	usage += "  # set log-verbosity for virt-handler to 7 and virt-launcher to 3\n"
+	usage += "  {{ProgramName}} adm log-verbosity --virt-handler=7 --virt-launcher=3\n"
+
+	usage += "  # reset all components to default besides virt-handler which is 7\n"
+	usage += "  {{ProgramName}} adm log-verbosity --reset --virt-handler=7\n"
+	usage += "  # set all components to 3 besides virt-handler which is 7\n"
+	usage += "  {{ProgramName}} adm log-verbosity --all=3 --virt-handler=7\n"
+
+	return usage
+}
+
+// component name to JSON name
+func getJSONNameByComponentName(componentName string) string {
+	var componentNameToJSONName = map[string]string{
+		"virt-api":        "virtAPI",
+		"virt-controller": "virtController",
+		"virt-handler":    "virtHandler",
+		"virt-launcher":   "virtLauncher",
+		"virt-operator":   "virtOperator",
+		"all":             "all",
+	}
+	return componentNameToJSONName[componentName]
+}
+
+func detectInstallNamespaceAndName(virtClient kubecli.KubevirtClient) (namespace, name string, err error) {
+	kvs, err := virtClient.KubeVirt(k8smetav1.NamespaceAll).List(&k8smetav1.ListOptions{})
+	if err != nil {
+		return "", "", fmt.Errorf("could not list KubeVirt CRs across all namespaces: %v", err)
+	}
+	if len(kvs.Items) == 0 {
+		return "", "", errors.New("could not detect a KubeVirt installation")
+	}
+	if len(kvs.Items) > 1 {
+		return "", "", errors.New("invalid kubevirt installation, more than one KubeVirt resource found")
+	}
+	namespace = kvs.Items[0].Namespace
+	name = kvs.Items[0].Name
+	return
+}
+
+func hasVerbosityInKV(kv *v1.KubeVirt) (map[string]uint, error) {
+	verbosityMap := map[string]uint{} // key: component name, value: verbosity
+
+	// if LogVerbosity is not present in the KubeVirt CR, skip here
+	if kv.Spec.Configuration.DeveloperConfiguration.LogVerbosity != nil {
+		// get the logVerbosity field in the KubeVirt CR, and put it to verbosityMap
+		lvJSON, err := json.Marshal(kv.Spec.Configuration.DeveloperConfiguration.LogVerbosity)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(lvJSON, &verbosityMap); err != nil {
+			return nil, err
+		}
+	}
+
+	return verbosityMap, nil
+}
+
+func createOutputLines(verbosityVal map[string]uint) []string {
+	var lines []string
+
+	allIsSet := (*virtComponents["all"] != NoFlag)
+
+	for componentName, verbosity := range virtComponents {
+		if componentName == allComponent {
+			continue
+		}
+		JSONName := getJSONNameByComponentName(componentName)
+		if *verbosity != NoFlag || allIsSet {
+			line := fmt.Sprintf("%s=%d", componentName, verbosityVal[JSONName])
+			lines = append(lines, line)
+		}
+	}
+
+	// output message sorted by lexicographical order of component name
+	sort.Strings(lines)
+
+	return lines
+}
+
+func createShowMessage(currentLv map[string]uint) []string {
+	// fill the unattended verbosity with default verbosity
+	// key: JSONName, value: verbosity
+	var verbosityVal = map[string]uint{
+		"virtAPI":        virtconfig.DefaultVirtAPILogVerbosity,
+		"virtController": virtconfig.DefaultVirtControllerLogVerbosity,
+		"virtHandler":    virtconfig.DefaultVirtHandlerLogVerbosity,
+		"virtLauncher":   virtconfig.DefaultVirtLauncherLogVerbosity,
+		"virtOperator":   virtconfig.DefaultVirtOperatorLogVerbosity,
+	}
+
+	// update the verbosity based on the existing verbosity in the KubeVirt CR
+	for key, value := range currentLv {
+		verbosityVal[key] = value
+	}
+
+	lines := createOutputLines(verbosityVal)
+
+	return lines
+}
+
+func addPatch(patchData *[]patch.PatchOperation, currentLv map[string]uint) {
+	*patchData = append(*patchData, patch.PatchOperation{
+		Op:    patchOperation,
+		Path:  patchPath,
+		Value: currentLv,
+	})
+}
+
+func setVerbosity(currentLv map[string]uint, patchData *[]patch.PatchOperation) {
+	// update currentLv based on the user-specified verbosity for all components
+	if *virtComponents["all"] != NoFlag {
+		for componentName := range virtComponents {
+			if componentName == allComponent {
+				continue
+			}
+			JSONName := getJSONNameByComponentName(componentName)
+			currentLv[JSONName] = *virtComponents["all"]
+		}
+	}
+
+	// update currentLv based on the user-specified verbosity for each component
+	for componentName, verbosity := range virtComponents {
+		if componentName == allComponent || *verbosity == NoFlag {
+			continue
+		}
+		JSONName := getJSONNameByComponentName(componentName)
+		currentLv[JSONName] = *verbosity
+	}
+
+	// in case of just reset (no set operation after the reset), don't need to add another patch
+	if len(currentLv) != 0 {
+		addPatch(patchData, currentLv)
+	}
+}
+
+func createPatch(currentLv map[string]uint) ([]byte, error) {
+	patchData := []patch.PatchOperation{}
+
+	// reset only if verbosity exists, otherwise do nothing
+	if isReset && len(currentLv) != 0 {
+		// add an empty object
+		currentLv = map[string]uint{}
+		addPatch(&patchData, currentLv)
+	}
+
+	setVerbosity(currentLv, &patchData)
+
+	return json.Marshal(patchData)
+}
+
+func findOperation(cmd *cobra.Command) (operation, error) {
+	isShow, isSet := false, false
+
+	for componentName, verbosity := range virtComponents {
+		// check if the flag for the component is specified
+		// cannot use NoFlag to check, because user can accidentally specify the same number as NoFlag for the verbosity
+		if !cmd.Flags().Changed(componentName) {
+			continue
+		}
+
+		// if flag is specified, it means either set or show
+		// if the value = noArg, it means show
+		// if the value != noArg, it means set
+		isShow = isShow || *verbosity == noArg
+		isSet = isSet || *verbosity != noArg
+
+		// check whether the verbosity is in the range
+		// NOTE: we have no choice but to allow noArg (=10)
+		// because there is no way to distinguish between user specified 10 and noArg after the command parsing
+		// so that --all=10 is equal to -all (show operation)
+		if *verbosity != noArg && *verbosity > maxVerbosity {
+			return nop, fmt.Errorf("%s: log verbosity must be %d-%d", componentName, minVerbosity, maxVerbosity)
+		}
+	}
+
+	// do not distinguish between set and reset at this point, because set and reset can coexist
+	if isReset {
+		isSet = true
+	}
+
+	if isShow && isSet {
+		return nop, errors.New("only show or set is allowed")
+	}
+
+	if isShow {
+		return show, nil
+	} else if isSet {
+		return set, nil
+	}
+
+	return nop, nil
+}
+
+func (c *Command) RunE(cmd *cobra.Command) error {
+	virtClient, err := kubecli.GetKubevirtClientFromClientConfig(c.clientConfig)
+	if err != nil {
+		return err
+	}
+	namespace, name, err := detectInstallNamespaceAndName(virtClient)
+	if err != nil {
+		return err
+	}
+	kv, err := virtClient.KubeVirt(namespace).Get(name, &k8smetav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	// check the operation type (nop/show/set)
+	op, err := findOperation(cmd)
+	if err != nil {
+		return err
+	}
+
+	switch op {
+	case nop:
+		err := cmd.Help()
+		if err != nil {
+			return err
+		}
+		return errors.New("no flag specified - expecting at least one flag")
+	case show:
+		// if verbosity has been set in the KubeVirt CR, use the verbosity
+		currentLv, err := hasVerbosityInKV(kv)
+		if err != nil {
+			return err
+		}
+		lines := createShowMessage(currentLv)
+		for _, line := range lines {
+			cmd.Println(line)
+		}
+	case set: // set and/or reset
+		// "Add" patch removes the value if we do not specify the value, even if we do not change the existing value.
+		// So, we need to get the existing verbosity in the KubeVirt CR.
+		currentLv, err := hasVerbosityInKV(kv)
+		if err != nil {
+			return err
+		}
+		patchData, err := createPatch(currentLv)
+		if err != nil {
+			return err
+		}
+		_, err = virtClient.KubeVirt(namespace).Patch(name, types.JSONPatchType, patchData, &k8smetav1.PatchOptions{})
+		if err != nil {
+			return err
+		}
+		cmd.Println("successfully set/reset the log verbosity")
+	default:
+		return fmt.Errorf("op: an unknown operation: %v", op)
+	}
+
+	return nil
+}
