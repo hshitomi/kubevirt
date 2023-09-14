@@ -19,11 +19,6 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 )
 
-const (
-	NAMESPACE = "kubevirt"
-	NAME      = "kubevirt"
-)
-
 type virtComponent int
 
 const (
@@ -48,7 +43,7 @@ var _ = Describe("Log Verbosity", func() {
 	BeforeEach(func() {
 
 		// create mock KubeVirt CR
-		kv = NewKubeVirtWithoutVerbosity(NAMESPACE, NAME)
+		kv = NewKubeVirtWithoutVerbosity("kubevirt", "kubevirt")
 		kvs = kubecli.NewKubeVirtList(*kv)
 
 		// create the wrapper that would return the mock virt client to the code being unit tested
@@ -60,13 +55,13 @@ var _ = Describe("Log Verbosity", func() {
 		kvInterface = kubecli.NewMockKubeVirtInterface(ctrl)
 
 		// set up mock client bahavior
-		kubecli.MockKubevirtClientInstance.EXPECT().KubeVirt(NAMESPACE).Return(kvInterface).AnyTimes()
+		kubecli.MockKubevirtClientInstance.EXPECT().KubeVirt("kubevirt").Return(kvInterface).AnyTimes()
 		kubecli.MockKubevirtClientInstance.EXPECT().KubeVirt("").Return(kvInterface).AnyTimes()
 
 		// set up mock interface behavior
-		kvInterface.EXPECT().Get(NAME, gomock.Any()).Return(kv, nil).AnyTimes()
+		kvInterface.EXPECT().Get("kubevirt", gomock.Any()).Return(kv, nil).AnyTimes()
 		kvInterface.EXPECT().List(gomock.Any()).Return(kvs, nil).AnyTimes()
-		kvInterface.EXPECT().Patch(NAME, types.JSONPatchType, gomock.Any(), gomock.Any()).DoAndReturn(
+		kvInterface.EXPECT().Patch("kubevirt", types.JSONPatchType, gomock.Any(), gomock.Any()).DoAndReturn(
 			func(_ any, _ any, patchData []byte, _ any, _ ...any) (*v1.KubeVirt, error) {
 				patch, err := jsonpatch.DecodePatch(patchData)
 				Expect(err).ToNot(HaveOccurred())
@@ -95,7 +90,7 @@ var _ = Describe("Log Verbosity", func() {
 			})
 		})
 
-		DescribeTable("should fail handled by cobra", func(args ...string) {
+		DescribeTable("should fail handled by the CLI package", func(args ...string) {
 			argStr := strings.Join(args, ",")
 			cmd := clientcmd.NewRepeatableVirtctlCommand("adm", "log-verbosity", argStr)
 			err := cmd()
