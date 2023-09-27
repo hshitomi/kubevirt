@@ -28,8 +28,8 @@ type Command struct {
 
 const (
 	// for command parsing
-	noFlag = math.MaxUint - 1 // Default value if the flag is not specified (flag to determine whether the flag is set or not)
-	noArg  = math.MaxUint     // Default value if an argument is not specified (e.g. "--virt-api" = "--virt-api=18446744073709551615")
+	noFlag = math.MaxUint - 1 // Default value if no flag is specified (dummy, we use cmd.Flags().Changed() to check if a flag is specified)
+	noArg  = math.MaxUint     // Default value if no argument specified (e.g. "--virt-api" = "--virt-api=18446744073709551615")
 	// verbosity must be 0-9
 	// https://kubernetes.io/docs/reference/kubectl/cheatsheet/#kubectl-output-verbosity-and-debugging
 	minVerbosity = uint(0)
@@ -52,25 +52,9 @@ const (
 
 const virtComponentNum = int(all) + 1 // number of virt components
 
-// to store the necessary information of each component
-type virtComponentInfo struct {
-	name      string // virt component name
-	jsonName  string // JSON name
-	verbosity uint   // log verbosity
-	showFlag  bool   // true: if this component is a target of show operation
-	setFlag   bool   // true: if this component is a target of set operation
-}
-
 // for receiving the flag argument
-var (
-	apiVerbosity        uint
-	controllerVerbosity uint
-	handlerVerbosity    uint
-	launcherVerbosity   uint
-	operatorVerbosity   uint
-	allVerbosity        uint
-	resetFlag           bool
-)
+var verbosities [virtComponentNum]uint
+var isReset bool
 
 // operation type of log-verbosity command
 type operation int
@@ -102,27 +86,27 @@ func NewCommand(clientConfig clientcmd.ClientConfig) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().UintVar(&apiVerbosity, "virt-api", noFlag, "show/set virt-api log verbosity (0-9)")
+	cmd.Flags().UintVar(&verbosities[virtAPI], "virt-api", noFlag, "show/set virt-api log verbosity (0-9)")
 	// Set the default value if the flag has no argument, because we use the flag without an argument (e.g. --virt-api) to show verbosity.
 	// Otherwise, the pflag package will return an error due to missing argument.
 	cmd.Flags().Lookup("virt-api").NoOptDefVal = strconv.FormatUint(noArg, 10)
 
-	cmd.Flags().UintVar(&controllerVerbosity, "virt-controller", noFlag, "show/set virt-controller log verbosity (0-9)")
+	cmd.Flags().UintVar(&verbosities[virtController], "virt-controller", noFlag, "show/set virt-controller log verbosity (0-9)")
 	cmd.Flags().Lookup("virt-controller").NoOptDefVal = strconv.FormatUint(noArg, 10)
 
-	cmd.Flags().UintVar(&handlerVerbosity, "virt-handler", noFlag, "show/set virt-handler log verbosity (0-9)")
+	cmd.Flags().UintVar(&verbosities[virtHandler], "virt-handler", noFlag, "show/set virt-handler log verbosity (0-9)")
 	cmd.Flags().Lookup("virt-handler").NoOptDefVal = strconv.FormatUint(noArg, 10)
 
-	cmd.Flags().UintVar(&launcherVerbosity, "virt-launcher", noFlag, "show/set virt-launcher log verbosity (0-9)")
+	cmd.Flags().UintVar(&verbosities[virtLauncher], "virt-launcher", noFlag, "show/set virt-launcher log verbosity (0-9)")
 	cmd.Flags().Lookup("virt-launcher").NoOptDefVal = strconv.FormatUint(noArg, 10)
 
-	cmd.Flags().UintVar(&operatorVerbosity, "virt-operator", noFlag, "show/set virt-operator log verbosity (0-9)")
+	cmd.Flags().UintVar(&verbosities[virtOperator], "virt-operator", noFlag, "show/set virt-operator log verbosity (0-9)")
 	cmd.Flags().Lookup("virt-operator").NoOptDefVal = strconv.FormatUint(noArg, 10)
 
-	cmd.Flags().UintVar(&allVerbosity, "all", noFlag, "show/set all component log verbosity (0-9)")
+	cmd.Flags().UintVar(&verbosities[all], "all", noFlag, "show/set all component log verbosity (0-9)")
 	cmd.Flags().Lookup("all").NoOptDefVal = strconv.FormatUint(noArg, 10)
 
-	cmd.Flags().BoolVar(&resetFlag, "reset", false, "reset log verbosity to the default verbosity (2) (empty the log verbosity)")
+	cmd.Flags().BoolVar(&isReset, "reset", false, "reset log verbosity to the default verbosity (2) (empty the log verbosity)")
 
 	// cannot specify "reset" and "all" flag at the same time
 	cmd.MarkFlagsMutuallyExclusive("reset", "all")
@@ -169,6 +153,45 @@ func usage() string {
 	return usage
 }
 
+// virtComponent to component name
+func getComponentNameByVirtComponent(component virtComponent) string {
+	var virtComponentToComponentName = map[virtComponent]string{
+		virtAPI:        "virt-api",
+		virtController: "virt-controller",
+		virtHandler:    "virt-handler",
+		virtLauncher:   "virt-launcher",
+		virtOperator:   "virt-operator",
+		all:            "all",
+	}
+	return virtComponentToComponentName[component]
+}
+
+// virtComponent to JSON name
+func getJSONNameByVirtComponent(component virtComponent) string {
+	var virtComponentToJSONName = map[virtComponent]string{
+		virtAPI:        "virtAPI",
+		virtController: "virtController",
+		virtHandler:    "virtHandler",
+		virtLauncher:   "virtLauncher",
+		virtOperator:   "virtOperator",
+		all:            "all",
+	}
+	return virtComponentToJSONName[component]
+}
+
+// component name to JSON name
+func getJSONNameByComponentName(componentName string) string {
+	var componentNameToJSONName = map[string]string{
+		"virt-api":        "virtAPI",
+		"virt-controller": "virtController",
+		"virt-handler":    "virtHandler",
+		"virt-launcher":   "virtLauncher",
+		"virt-operator":   "virtOperator",
+		"all":             "all",
+	}
+	return componentNameToJSONName[componentName]
+}
+
 func detectInstallNamespaceAndName(virtClient kubecli.KubevirtClient) (namespace, name string, err error) {
 	// listing KubeVirt CRs in all namespaces and see where it is installed
 	kvs, err := virtClient.KubeVirt("").List(&k8smetav1.ListOptions{})
@@ -186,83 +209,44 @@ func detectInstallNamespaceAndName(virtClient kubecli.KubevirtClient) (namespace
 	return
 }
 
-func hasTarget(componentInfo *[virtComponentNum]*virtComponentInfo) (hasShowTarget, hasSetTarget bool) {
-	var component virtComponent
-	for component = virtAPI; component <= all; component++ {
-		if !hasShowTarget && componentInfo[component].showFlag {
-			hasShowTarget = true
-		} else if !hasSetTarget && componentInfo[component].setFlag {
-			hasSetTarget = true
-		} else if hasShowTarget && hasSetTarget {
-			// if at least one target of both show and set is found, return early (do not need to iterate through the end)
-			return hasShowTarget, hasSetTarget
-		}
-	}
-	return hasShowTarget, hasSetTarget
-}
-
-func findOperation(componentInfo *[virtComponentNum]*virtComponentInfo) (operation, error) {
-	hasShowTarget, hasSetTarget := hasTarget(componentInfo) // true: if at least one component is the target of show/set operation
-	if hasShowTarget && hasSetTarget {
-		return -1, errors.New("show and set cannot coexist") // -1: dummy
-	} else if hasShowTarget && resetFlag {
-		return -1, errors.New("show and reset cannot coexist") // -1: dummy
-	} else if hasShowTarget {
-		return show, nil
-	} else if hasSetTarget || resetFlag {
-		return set, nil
-	}
-	return nop, nil // no flag specified
-}
-
-// check the logVerbosity field in the KubeVirt CR
-// if there is a logVerbosity field, input the JSON data to the verbosityMap
 func hasVerbosityInKV(kv *v1.KubeVirt) (map[string]uint, error) {
-	verbosityMap := map[string]uint{} // key: name of virt component, value: verbosity
+	verbosityMap := map[string]uint{} // key: component name, value: verbosity
+	// check the logVerbosity field in the KubeVirt CR
 	lvJSON, err := json.Marshal(kv.Spec.Configuration.DeveloperConfiguration.LogVerbosity)
 	if err != nil {
 		return nil, err
 	}
+	// if there is a logVerbosity field, input the JSON data to the verbosityMap
 	if err := json.Unmarshal(lvJSON, &verbosityMap); err != nil {
 		return nil, err
 	}
 	return verbosityMap, nil
 }
 
-func createOutputMessage(verbosityVal *[virtComponentNum - 1]uint, componentInfo *[virtComponentNum]*virtComponentInfo) *string {
-	var message string
-	var component virtComponent
-	for component = virtAPI; component < all; component++ { // all is the last component, and do not need to check it
-		if componentInfo[component].showFlag || componentInfo[all].showFlag {
-			// output format is like:
-			// virt-api=1
-			// virt-controller=2
-			message += fmt.Sprintf("%s=%d\n", componentInfo[component].name, verbosityVal[component])
+func createOutputMessage(verbosityVal map[string]uint, options map[string]uint) []string {
+	var messages []string
+	for component := virtAPI; component < all; component++ { // all is the last component, and do not need to check it
+		componentName := getComponentNameByVirtComponent(component)
+		JSONName := getJSONNameByVirtComponent(component)
+		if _, exist := options["all"]; exist {
+			messages = append(messages, fmt.Sprintf("%s=%d", componentName, verbosityVal[JSONName]))
+		} else if _, exist := options[componentName]; exist {
+			messages = append(messages, fmt.Sprintf("%s=%d", componentName, verbosityVal[JSONName]))
 		}
 	}
-	return &message
+	return messages
 }
 
-func getComponentByJSON(jsonName string) virtComponent {
-	var jsonToComponent = map[string]virtComponent{
-		"virtAPI":        virtAPI,
-		"virtController": virtController,
-		"virtHandler":    virtHandler,
-		"virtLauncher":   virtLauncher,
-		"virtOperator":   virtOperator,
-	}
-	return jsonToComponent[jsonName]
-}
-
-func createShowMessage(kv *v1.KubeVirt, componentInfo *[virtComponentNum]*virtComponentInfo) (*string, error) {
+func createShowMessage(kv *v1.KubeVirt, options map[string]uint) ([]string, error) {
 	// set default verbosity first
 	// it is used to fill the unattended verbosity with default verbosity
-	verbosityVal := [virtComponentNum - 1]uint{
-		uint(virtconfig.DefaultVirtAPILogVerbosity),
-		uint(virtconfig.DefaultVirtControllerLogVerbosity),
-		uint(virtconfig.DefaultVirtHandlerLogVerbosity),
-		uint(virtconfig.DefaultVirtLauncherLogVerbosity),
-		uint(virtconfig.DefaultVirtOperatorLogVerbosity),
+	// key: JSONName, value: verbosity
+	var verbosityVal = map[string]uint{
+		"virtAPI":        virtconfig.DefaultVirtAPILogVerbosity,
+		"virtController": virtconfig.DefaultVirtControllerLogVerbosity,
+		"virtHandler":    virtconfig.DefaultVirtHandlerLogVerbosity,
+		"virtLauncher":   virtconfig.DefaultVirtLauncherLogVerbosity,
+		"virtOperator":   virtconfig.DefaultVirtOperatorLogVerbosity,
 	}
 
 	// if verbosity has been set in the KubeVirt CR, use the verbosity
@@ -272,38 +256,35 @@ func createShowMessage(kv *v1.KubeVirt, componentInfo *[virtComponentNum]*virtCo
 	}
 	if len(lvMap) > 0 {
 		for key, value := range lvMap {
-			verbosityVal[getComponentByJSON(key)] = value
+			verbosityVal[key] = value
 		}
 	}
 
 	// create a message to show verbosity for the specified component
-	message := createOutputMessage(&verbosityVal, componentInfo)
+	messages := createOutputMessage(verbosityVal, options)
 
-	return message, nil
+	return messages, nil
 }
 
-func setVerbosity(lvMap map[string]uint, componentInfo *[virtComponentNum]*virtComponentInfo) {
-	var component virtComponent
-	for component = virtAPI; component < all; component++ { // all is the last component, and do not need to check it
-		var val uint
-		val = math.MaxUint
-		if componentInfo[component].setFlag {
-			// set verbosity specified for this component
-			val = componentInfo[component].verbosity
-		} else if !componentInfo[component].setFlag && componentInfo[all].setFlag {
-			// set verbosity specified for all components
-			val = componentInfo[all].verbosity
-		} else if !componentInfo[component].setFlag && !componentInfo[all].setFlag && !resetFlag {
-			// verbosity not specified for this component
-			// Use existing verbosity (in KubeVirt CR), if any.
-			// Otherwise do nothing (no verbosity specified, and no existing verbosity in KubeVirt CR).
-			if tempVal, exist := lvMap[componentInfo[component].jsonName]; exist {
-				val = tempVal
-			}
+func setVerbosity(lvMap map[string]uint, options map[string]uint, patchData *[]patch.PatchOperation, op *string, path *string) {
+	// update lvMap based on the user-specified verbosity for all components
+	if verbosity, exist := options["all"]; exist {
+		for component := virtAPI; component < all; component++ {
+			JSONName := getJSONNameByVirtComponent(component)
+			lvMap[JSONName] = verbosity
 		}
-		if val != math.MaxUint {
-			lvMap[componentInfo[component].jsonName] = val
+	}
+	// update lvMap based on the user-specified verbosity for each component
+	for componentName, verbosity := range options {
+		if componentName == "all" {
+			continue
 		}
+		JSONName := getJSONNameByComponentName(componentName)
+		lvMap[JSONName] = verbosity
+	}
+
+	if len(lvMap) != 0 {
+		addPatch(patchData, op, path, lvMap)
 	}
 }
 
@@ -315,98 +296,97 @@ func addPatch(patchData *[]patch.PatchOperation, op *string, path *string, lvMap
 	})
 }
 
-func createPatch(kv *v1.KubeVirt, componentInfo *[virtComponentNum]*virtComponentInfo) ([]byte, error) {
+func resetVerbosity(lvMap map[string]uint, patchData *[]patch.PatchOperation, op *string, path *string) {
+	// reset only if verbosity exists, otherwise do nothing
+	if len(lvMap) != 0 {
+		// add an empty object (removing the logVerbosity field can be another method)
+		emptyMap := map[string]uint{} // does not change the caller's lvMap
+		addPatch(patchData, op, path, emptyMap)
+	}
+}
+
+func createPatch(kv *v1.KubeVirt, options map[string]uint) ([]byte, error) {
 	patchData := []patch.PatchOperation{}
+	// just "add" is fine, no need of "replace" and "remove"
+	// https://www.rfc-editor.org/rfc/rfc6902
+	op := patch.PatchAddOp
+	path := "/spec/configuration/developerConfiguration/logVerbosity"
 
 	// if there is a logVerbosity field in the KubeVirt CR, fill in the data in the lvMap
 	lvMap, err := hasVerbosityInKV(kv)
 	if err != nil {
 		return nil, err
 	}
-
-	// "add" works well, no need of "replace"
-	// https://www.rfc-editor.org/rfc/rfc6902
-	op := patch.PatchAddOp
-	path := "/spec/configuration/developerConfiguration/logVerbosity"
-
-	// reset first, if reset flag is on
-	if resetFlag {
-		// reset only if verbosity exists
-		if len(lvMap) != 0 {
-			lvMap = map[string]uint{}               // reset existing verbosity
-			addPatch(&patchData, &op, &path, lvMap) // add empty object, instead of removing logVerbosity field
-		}
-	}
-
 	if lvMap == nil {
 		// if map is nil (logVerbosity field in the KubeVert CR is nil), need initialization
-		// otherwise key and value cannot be set in lvMap
 		lvMap = make(map[string]uint)
 	}
 
-	// if the verbosity is specified for the component, update lvMap entry with the verbosity
-	setVerbosity(lvMap, componentInfo)
-
-	if len(lvMap) != 0 {
-		addPatch(&patchData, &op, &path, lvMap)
+	if isReset {
+		resetVerbosity(lvMap, &patchData, &op, &path)
+		lvMap = map[string]uint{}
 	}
+
+	// if the verbosity is specified for the component, update lvMap entry with the verbosity
+	// if the verbosity is not specified for the component, and there is an existing verbosity in KubeVirt CR, use the existing verbosity
+	// if we do not use the existing verbosity, the existing verbosity will be removed
+	// if we use replace patch, it is possible to avoid removing the existing verbosity
+	// (if components have exiting verbosity, use replace patch, if components do not have exiting verbosity, use add patch),
+	// but we have to manage which components have the existing verbosity, which makes the code complicated
+	setVerbosity(lvMap, options, &patchData, &op, &path)
 
 	return json.Marshal(patchData)
 }
 
-func setComponentInfo(cmd *cobra.Command, componentInfo *[virtComponentNum]*virtComponentInfo) error {
-	componentEntries := [virtComponentNum]virtComponentInfo{
-		{name: "virt-api", jsonName: "virtAPI", verbosity: apiVerbosity, showFlag: false, setFlag: false},
-		{name: "virt-controller", jsonName: "virtController", verbosity: controllerVerbosity, showFlag: false, setFlag: false},
-		{name: "virt-handler", jsonName: "virtHandler", verbosity: handlerVerbosity, showFlag: false, setFlag: false},
-		{name: "virt-launcher", jsonName: "virtLauncher", verbosity: launcherVerbosity, showFlag: false, setFlag: false},
-		{name: "virt-operator", jsonName: "virtOperator", verbosity: operatorVerbosity, showFlag: false, setFlag: false},
-		{name: "all", jsonName: "", verbosity: allVerbosity, showFlag: false, setFlag: false},
-	}
+func findOperation(cmd *cobra.Command, options map[string]uint) (operation, error) {
+	isShow, isSet := false, false
 
-	var component virtComponent
-	for component = virtAPI; component <= all; component++ {
-		// check for the existence of flag and argument, and set hasFlag and hasArg
-		// also check for the verbosity in the range (0-9)
-		var hasFlag = false
-		var hasArg = false
-		if cmd.Flags().Changed(componentEntries[component].name) {
-			hasFlag = true
-			if componentEntries[component].verbosity != noArg {
-				hasArg = true
-				if componentEntries[component].verbosity > maxVerbosity && componentEntries[component].verbosity < noArg {
-					// verbosity out of range
-					return fmt.Errorf("%s: log verbosity must be %d-%d", componentEntries[component].name, minVerbosity, maxVerbosity)
-				}
-			}
+	for component := virtAPI; component <= all; component++ {
+		componentName := getComponentNameByVirtComponent(component)
+
+		// check if the flag for the component is specified
+		if !cmd.Flags().Changed(componentName) {
+			continue // do nothing for the component
 		}
 
-		// set showFlag and setFlag for the component based on the following criteria
-		// show : hasFlag==true and hasArg==false
-		// set : hasFlag==true and hasArg==true
-		if hasFlag && !hasArg { // show
-			componentEntries[component].showFlag = true
-		} else if hasFlag && hasArg { // set
-			componentEntries[component].setFlag = true
+		// if flag is specified, it means either set or show
+		// if the value = noArg, it means show
+		// if the value != noArg, it means set
+		isShow = isShow || verbosities[component] == noArg
+		isSet = isSet || verbosities[component] != noArg
+
+		// check whether the verbosity is in the range
+		if verbosities[component] != noArg && verbosities[component] > maxVerbosity {
+			return nop, fmt.Errorf("%s: log verbosity must be %d-%d", componentName, minVerbosity, maxVerbosity)
 		}
 
-		// set each componentInfo
-		componentInfo[component] = &componentEntries[component]
+		// add a componentName and its verbosity to the map
+		// in case of show: verbosity = noArg
+		// in case of set: verbosity = 0-9
+		// in case of reset: no information added to the map
+		options[componentName] = verbosities[component]
 	}
 
-	return nil
+	// do not distinguish between set and reset at this point
+	// because set and reset can coexist
+	if isReset {
+		isSet = true
+	}
+
+	if isShow && isSet {
+		return nop, fmt.Errorf("only show or set is allowed")
+	}
+
+	if isShow {
+		return show, nil
+	} else if isSet {
+		return set, nil
+	}
+
+	return nop, nil
 }
 
 func (c *Command) RunE(cmd *cobra.Command) error {
-	var componentInfo [virtComponentNum]*virtComponentInfo // stores the information needed by each component to execute the command
-
-	// set componentInfo
-	// after this function, the componentInfo will never be changed
-	err := setComponentInfo(cmd, &componentInfo)
-	if err != nil {
-		return err
-	}
-
 	// get client
 	virtClient, err := kubecli.GetKubevirtClientFromClientConfig(c.clientConfig)
 	if err != nil {
@@ -423,8 +403,9 @@ func (c *Command) RunE(cmd *cobra.Command) error {
 		return err
 	}
 
-	// check the operation type (nop/show/set)
-	op, err := findOperation(&componentInfo)
+	// check the operation type (nop/show/set), and set the options map to use the map for show and set operations
+	options := map[string]uint{} // key: component name, value: verbosity
+	op, err := findOperation(cmd, options)
 	if err != nil {
 		return err
 	}
@@ -437,14 +418,16 @@ func (c *Command) RunE(cmd *cobra.Command) error {
 		}
 		return errors.New("no flag specified - expecting at least one flag")
 	case show:
-		message, err := createShowMessage(kv, &componentInfo)
+		messages, err := createShowMessage(kv, options)
 		if err != nil {
 			return err
 		}
-		cmd.Println(*message)
-	case set:
+		for _, message := range messages {
+			cmd.Println(message)
+		}
+	case set: // set and/or reset
 		// create patch data
-		patchData, err := createPatch(kv, &componentInfo)
+		patchData, err := createPatch(kv, options)
 		if err != nil {
 			return err
 		}

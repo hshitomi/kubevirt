@@ -111,8 +111,8 @@ var _ = Describe("Log Verbosity", func() {
 
 			Expect(err).To(MatchError(ContainSubstring(output)))
 		},
-			Entry("show and set mix", "show and set cannot coexist", "--virt-handler", "--virt-launcher=3"),
-			Entry("show and reset mix", "show and reset cannot coexist", "--reset", "--virt-launcher"),
+			Entry("show and set mix", "only show or set is allowed", "--virt-handler", "--virt-launcher=3"),
+			Entry("show and reset mix", "only show or set is allowed", "--reset", "--virt-launcher"),
 			Entry("10 or above verbosity", "virt-api: log verbosity must be 0-9", "--virt-api=10"),
 			Entry("one valid verbosity, one invalid verbosity", "virt-handler: log verbosity must be 0-9", "--virt-api=5", "--virt-handler=20"),
 		)
