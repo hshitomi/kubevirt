@@ -65,6 +65,14 @@ const (
 	nop
 )
 
+// for patch operation
+const (
+	// just "add" is fine, no need of "replace" and "remove"
+	// https://www.rfc-editor.org/rfc/rfc6902
+	patchOperation = patch.PatchAddOp
+	patchPath      = "/spec/configuration/developerConfiguration/logVerbosity"
+)
+
 func NewCommand(clientConfig clientcmd.ClientConfig) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "log-verbosity",
@@ -223,23 +231,25 @@ func hasVerbosityInKV(kv *v1.KubeVirt) (map[string]uint, error) {
 	return verbosityMap, nil
 }
 
-func createOutputMessage(verbosityVal map[string]uint, options map[string]uint) []string {
-	var messages []string
+func createOutputLines(verbosityVal map[string]uint, options map[string]uint) []string {
+	var lines []string
+	allIsSet := false
+	if _, exist := options["all"]; exist {
+		allIsSet = true
+	}
 	for component := virtAPI; component < all; component++ { // all is the last component, and do not need to check it
 		componentName := getComponentNameByVirtComponent(component)
 		JSONName := getJSONNameByVirtComponent(component)
-		if _, exist := options["all"]; exist {
-			messages = append(messages, fmt.Sprintf("%s=%d", componentName, verbosityVal[JSONName]))
-		} else if _, exist := options[componentName]; exist {
-			messages = append(messages, fmt.Sprintf("%s=%d", componentName, verbosityVal[JSONName]))
+		if _, exist := options[componentName]; exist || allIsSet {
+			line := fmt.Sprintf("%s=%d", componentName, verbosityVal[JSONName])
+			lines = append(lines, line)
 		}
 	}
-	return messages
+	return lines
 }
 
-func createShowMessage(kv *v1.KubeVirt, options map[string]uint) ([]string, error) {
-	// set default verbosity first
-	// it is used to fill the unattended verbosity with default verbosity
+func createShowMessage(currentLv, options map[string]uint) []string {
+	// fill the unattended verbosity with default verbosity
 	// key: JSONName, value: verbosity
 	var verbosityVal = map[string]uint{
 		"virtAPI":        virtconfig.DefaultVirtAPILogVerbosity,
@@ -249,91 +259,62 @@ func createShowMessage(kv *v1.KubeVirt, options map[string]uint) ([]string, erro
 		"virtOperator":   virtconfig.DefaultVirtOperatorLogVerbosity,
 	}
 
-	// if verbosity has been set in the KubeVirt CR, use the verbosity
-	lvMap, err := hasVerbosityInKV(kv)
-	if err != nil {
-		return nil, err
-	}
-	if len(lvMap) > 0 {
-		for key, value := range lvMap {
-			verbosityVal[key] = value
-		}
+	// update the verbosity based on the existing verbosity in the KubeVirt CR
+	for key, value := range currentLv {
+		verbosityVal[key] = value
 	}
 
 	// create a message to show verbosity for the specified component
-	messages := createOutputMessage(verbosityVal, options)
+	lines := createOutputLines(verbosityVal, options)
 
-	return messages, nil
+	return lines
 }
 
-func setVerbosity(lvMap map[string]uint, options map[string]uint, patchData *[]patch.PatchOperation, op *string, path *string) {
-	// update lvMap based on the user-specified verbosity for all components
+func addPatch(patchData *[]patch.PatchOperation, currentLv map[string]uint) {
+	*patchData = append(*patchData, patch.PatchOperation{
+		Op:    patchOperation,
+		Path:  patchPath,
+		Value: currentLv,
+	})
+}
+
+func setVerbosity(currentLv, options map[string]uint, patchData *[]patch.PatchOperation) {
+	// update currentLv based on the user-specified verbosity for all components
 	if verbosity, exist := options["all"]; exist {
 		for component := virtAPI; component < all; component++ {
 			JSONName := getJSONNameByVirtComponent(component)
-			lvMap[JSONName] = verbosity
+			currentLv[JSONName] = verbosity
 		}
 	}
-	// update lvMap based on the user-specified verbosity for each component
+
+	// update currentLv based on the user-specified verbosity for each component
 	for componentName, verbosity := range options {
 		if componentName == "all" {
 			continue
 		}
 		JSONName := getJSONNameByComponentName(componentName)
-		lvMap[JSONName] = verbosity
+		currentLv[JSONName] = verbosity
 	}
 
-	if len(lvMap) != 0 {
-		addPatch(patchData, op, path, lvMap)
-	}
-}
-
-func addPatch(patchData *[]patch.PatchOperation, op *string, path *string, lvMap map[string]uint) {
-	*patchData = append(*patchData, patch.PatchOperation{
-		Op:    *op,
-		Path:  *path,
-		Value: lvMap,
-	})
-}
-
-func resetVerbosity(lvMap map[string]uint, patchData *[]patch.PatchOperation, op *string, path *string) {
-	// reset only if verbosity exists, otherwise do nothing
-	if len(lvMap) != 0 {
-		// add an empty object (removing the logVerbosity field can be another method)
-		emptyMap := map[string]uint{} // does not change the caller's lvMap
-		addPatch(patchData, op, path, emptyMap)
+	// in case of just reset (no set operation after the reset), don't need to add another patch
+	if len(currentLv) != 0 {
+		addPatch(patchData, currentLv)
 	}
 }
 
-func createPatch(kv *v1.KubeVirt, options map[string]uint) ([]byte, error) {
+func createPatch(currentLv, options map[string]uint) ([]byte, error) {
 	patchData := []patch.PatchOperation{}
-	// just "add" is fine, no need of "replace" and "remove"
-	// https://www.rfc-editor.org/rfc/rfc6902
-	op := patch.PatchAddOp
-	path := "/spec/configuration/developerConfiguration/logVerbosity"
-
-	// if there is a logVerbosity field in the KubeVirt CR, fill in the data in the lvMap
-	lvMap, err := hasVerbosityInKV(kv)
-	if err != nil {
-		return nil, err
-	}
-	if lvMap == nil {
-		// if map is nil (logVerbosity field in the KubeVert CR is nil), need initialization
-		lvMap = make(map[string]uint)
-	}
 
 	if isReset {
-		resetVerbosity(lvMap, &patchData, &op, &path)
-		lvMap = map[string]uint{}
+		// reset only if verbosity exists, otherwise do nothing
+		if len(currentLv) != 0 {
+			// add an empty object (removing the logVerbosity field can be another method)
+			currentLv = map[string]uint{}
+			addPatch(&patchData, currentLv)
+		}
 	}
 
-	// if the verbosity is specified for the component, update lvMap entry with the verbosity
-	// if the verbosity is not specified for the component, and there is an existing verbosity in KubeVirt CR, use the existing verbosity
-	// if we do not use the existing verbosity, the existing verbosity will be removed
-	// if we use replace patch, it is possible to avoid removing the existing verbosity
-	// (if components have exiting verbosity, use replace patch, if components do not have exiting verbosity, use add patch),
-	// but we have to manage which components have the existing verbosity, which makes the code complicated
-	setVerbosity(lvMap, options, &patchData, &op, &path)
+	setVerbosity(currentLv, options, &patchData)
 
 	return json.Marshal(patchData)
 }
@@ -418,25 +399,37 @@ func (c *Command) RunE(cmd *cobra.Command) error {
 		}
 		return errors.New("no flag specified - expecting at least one flag")
 	case show:
-		messages, err := createShowMessage(kv, options)
+		// if verbosity has been set in the KubeVirt CR, use the verbosity
+		currentLv, err := hasVerbosityInKV(kv)
 		if err != nil {
 			return err
 		}
-		for _, message := range messages {
-			cmd.Println(message)
+		lines := createShowMessage(currentLv, options)
+		for _, line := range lines {
+			cmd.Println(line)
 		}
 	case set: // set and/or reset
-		// create patch data
-		patchData, err := createPatch(kv, options)
+		// if there is a logVerbosity field in the KubeVirt CR, fill the verbosity in the map
+		// when the verbosity is not specified for the component, and there is an existing verbosity in KubeVirt CR,
+		// we need currentLv (the existing verbosity in the KubeVirt CR),
+		// because if we do not use the existing verbosity, the existing verbosity will be removed.
+		currentLv, err := hasVerbosityInKV(kv)
 		if err != nil {
 			return err
 		}
-		// apply patch, if patch data exists
-		if len(patchData) != 0 {
-			_, err = virtClient.KubeVirt(namespace).Patch(name, types.JSONPatchType, patchData, &k8smetav1.PatchOptions{})
-			if err != nil {
-				return err
-			}
+		// if map is nil (= logVerbosity field in the KubeVert CR is nil), need initialization to access a key in the map
+		if currentLv == nil {
+			currentLv = make(map[string]uint)
+		}
+		// create patch data
+		patchData, err := createPatch(currentLv, options)
+		if err != nil {
+			return err
+		}
+		// apply patch
+		_, err = virtClient.KubeVirt(namespace).Patch(name, types.JSONPatchType, patchData, &k8smetav1.PatchOptions{})
+		if err != nil {
+			return err
 		}
 		cmd.Println("successfully set/reset the log verbosity")
 	default:
