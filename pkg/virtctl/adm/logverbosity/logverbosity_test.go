@@ -2,6 +2,7 @@ package logverbosity_test
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -17,37 +18,29 @@ import (
 
 	k8smetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "kubevirt.io/api/core/v1"
+
+	"kubevirt.io/kubevirt/pkg/virtctl/adm/logverbosity"
 )
-
-type virtComponent int
-
-const (
-	virtAPI virtComponent = iota // virtAPI must be at the first position because it is used for the iteration
-	virtController
-	virtHandler
-	virtLauncher
-	virtOperator
-	all // all must be at the end, because it is used for the iteration
-)
-
-const virtComponentNum = int(all) + 1 // number of virt components
 
 var _ = Describe("Log Verbosity", func() {
-
-	var ctrl *gomock.Controller
 	var kvInterface *kubecli.MockKubeVirtInterface
 
 	var kv *v1.KubeVirt
 	var kvs *v1.KubeVirtList
 
-	BeforeEach(func() {
+	// specify the KubeVirt install namespace and name for tests
+	const (
+		installNamespace = "kubevirt"
+		installName      = "kubevirt"
+	)
 
+	BeforeEach(func() {
 		// create mock KubeVirt CR
-		kv = NewKubeVirtWithoutVerbosity("kubevirt", "kubevirt")
+		kv = NewKubeVirtWithoutVerbosity(installNamespace, installName)
 		kvs = kubecli.NewKubeVirtList(*kv)
 
 		// create the wrapper that would return the mock virt client to the code being unit tested
-		ctrl = gomock.NewController(GinkgoT())
+		ctrl := gomock.NewController(GinkgoT())
 		kubecli.GetKubevirtClientFromClientConfig = kubecli.GetMockKubevirtClientFromClientConfig
 		kubecli.MockKubevirtClientInstance = kubecli.NewMockKubevirtClient(ctrl)
 
@@ -55,14 +48,14 @@ var _ = Describe("Log Verbosity", func() {
 		kvInterface = kubecli.NewMockKubeVirtInterface(ctrl)
 
 		// set up mock client bahavior
-		kubecli.MockKubevirtClientInstance.EXPECT().KubeVirt("kubevirt").Return(kvInterface).AnyTimes()
-		kubecli.MockKubevirtClientInstance.EXPECT().KubeVirt("").Return(kvInterface).AnyTimes()
+		kubecli.MockKubevirtClientInstance.EXPECT().KubeVirt(kvs.Items[0].Namespace).Return(kvInterface).AnyTimes() // Get & Patch
+		kubecli.MockKubevirtClientInstance.EXPECT().KubeVirt("").Return(kvInterface).AnyTimes()                     // List
 
 		// set up mock interface behavior
-		kvInterface.EXPECT().Get("kubevirt", gomock.Any()).Return(kv, nil).AnyTimes()
-		kvInterface.EXPECT().List(gomock.Any()).Return(kvs, nil).AnyTimes()
-		kvInterface.EXPECT().Patch("kubevirt", types.JSONPatchType, gomock.Any(), gomock.Any()).DoAndReturn(
-			func(_ any, _ any, patchData []byte, _ any, _ ...any) (*v1.KubeVirt, error) {
+		kvInterface.EXPECT().Patch(gomock.Any(), types.JSONPatchType, gomock.Any(), gomock.Any()).DoAndReturn(
+			func(name string, _ any, patchData []byte, _ any, _ ...any) (*v1.KubeVirt, error) {
+				Expect(name).To(Equal(kvs.Items[0].Name))
+
 				patch, err := jsonpatch.DecodePatch(patchData)
 				Expect(err).ToNot(HaveOccurred())
 				kvJSON, err := json.Marshal(kv)
@@ -80,7 +73,125 @@ var _ = Describe("Log Verbosity", func() {
 			}).AnyTimes()
 	})
 
+	When("with erroneous running environment", func() {
+		Context("client has an error", func() {
+			BeforeEach(func() {
+				// GET and LIST mock interfaces are not necessary, because an error is returned before GET and LIST are called
+				kubecli.GetKubevirtClientFromClientConfig = kubecli.GetInvalidKubevirtClientFromClientConfig
+			})
+
+			It("should fail (not executing the command)", func() {
+				cmd := clientcmd.NewRepeatableVirtctlCommand("adm", "log-verbosity", "--all")
+				Expect(cmd).NotTo(BeNil()) // not executing the command
+			})
+		})
+
+		Context("detectInstallNamespaceAndName has en error", func() {
+			// GET mock interface is not necessary, because an error is returned before GET is called
+
+			expectListError := func() {
+				kvInterface.EXPECT().List(gomock.Any()).DoAndReturn(
+					func(_ any) (*v1.KubeVirt, error) {
+						return nil, errors.New("List error")
+					}).AnyTimes()
+			}
+			expectEmptyKvs := func() {
+				kvInterface.EXPECT().List(gomock.Any()).DoAndReturn(
+					func(_ any) (*v1.KubeVirtList, error) {
+						emptyKvs := &v1.KubeVirtList{}
+						return emptyKvs, nil
+					}).AnyTimes()
+			}
+			expectMultipleKvs := func() {
+				kvInterface.EXPECT().List(gomock.Any()).DoAndReturn(
+					func(_ any) (*v1.KubeVirtList, error) {
+						kv1 := NewKubeVirtWithoutVerbosity("kubevirt1", "kubevirt1")
+						kv2 := NewKubeVirtWithoutVerbosity("kubevirt2", "kubevirt2")
+						multiKvs := kubecli.NewKubeVirtList(*kv1, *kv2)
+						return multiKvs, nil
+					}).AnyTimes()
+			}
+
+			DescribeTable("should fail", func(fn func(), output string) {
+				fn()
+				cmd := clientcmd.NewRepeatableVirtctlCommand("adm", "log-verbosity", "--all")
+				err := cmd()
+				Expect(err).NotTo(Succeed())
+				Expect(err).To(MatchError(ContainSubstring(output)))
+			},
+				// simulate something like no permission to access the namespace
+				Entry("List function error", expectListError, "could not list KubeVirt CRs in all namespaces: List error"),
+				// simulate no KubeVirt installation
+				Entry("empty kvs", expectEmptyKvs, "could not detect a KubeVirt installation"),
+				// simulate invalid KubeVirt installation
+				Entry("multiple kvs", expectMultipleKvs, "invalid kubevirt installation, more than one KubeVirt resource found"),
+			)
+		})
+
+		Context("Get function has an error", func() {
+			BeforeEach(func() {
+				kvInterface.EXPECT().List(gomock.Any()).Return(kvs, nil).AnyTimes()
+			})
+
+			expectGetError := func() {
+				kvInterface.EXPECT().Get(gomock.Any(), gomock.Any()).DoAndReturn(
+					func(name string, _ any) (*v1.KubeVirt, error) {
+						Expect(name).To(Equal(kvs.Items[0].Name))
+						return nil, errors.New("Get error")
+					}).AnyTimes()
+			}
+
+			It("should fail", func() {
+				expectGetError() // for some reason, Get function returns an error
+				cmd := clientcmd.NewRepeatableVirtctlCommand("adm", "log-verbosity", "--all")
+				err := cmd()
+				Expect(err).NotTo(Succeed())
+				Expect(err).To(MatchError(ContainSubstring("Get error")))
+			})
+		})
+	})
+
+	When("with install namespace and name other than kubevirt", func() {
+		BeforeEach(func() {
+			kv = NewKubeVirtWithoutVerbosity("foo", "foo")
+			kvs = kubecli.NewKubeVirtList(*kv)
+
+			kubecli.MockKubevirtClientInstance.EXPECT().KubeVirt(kvs.Items[0].Namespace).Return(kvInterface).AnyTimes() // Get & Patch
+			kvInterface.EXPECT().List(gomock.Any()).Return(kvs, nil).AnyTimes()
+		})
+
+		expectGetKv := func() {
+			kvInterface.EXPECT().Get(gomock.Any(), gomock.Any()).DoAndReturn(
+				func(name string, _ any) (*v1.KubeVirt, error) {
+					Expect(name).To(Equal(kvs.Items[0].Name))
+					return &kvs.Items[0], nil
+				}).AnyTimes()
+		}
+
+		It("show: should succeed", func() {
+			expectGetKv()
+			bytes, err := clientcmd.NewRepeatableVirtctlCommandWithOut("adm", "log-verbosity", "--all")()
+			Expect(err).To(Succeed())
+			output := []uint{2, 2, 2, 2, 2}
+			message := createOutputMessage(output)
+			Expect(string(bytes)).To(ContainSubstring(*message))
+		})
+
+		It("set: should succeed", func() {
+			expectGetKv()
+			cmd := clientcmd.NewRepeatableVirtctlCommand("adm", "log-verbosity", "--all=7")
+			Expect(cmd()).To(Succeed())
+			output := []uint{7, 7, 7, 7, 7}
+			expectAllComponentVerbosity(kv, output)
+		})
+	})
+
 	When("with invalid set of flags", func() {
+		BeforeEach(func() {
+			kvInterface.EXPECT().List(gomock.Any()).Return(kvs, nil).AnyTimes()
+			kvInterface.EXPECT().Get(kvs.Items[0].Name, gomock.Any()).Return(&kvs.Items[0], nil).AnyTimes()
+		})
+
 		Context("with empty set of flags", func() {
 			It("should fail (return help)", func() {
 				cmd := clientcmd.NewRepeatableVirtctlCommand("adm", "log-verbosity")
@@ -113,13 +224,18 @@ var _ = Describe("Log Verbosity", func() {
 		},
 			Entry("show and set mix", "only show or set is allowed", "--virt-handler", "--virt-launcher=3"),
 			Entry("show and reset mix", "only show or set is allowed", "--reset", "--virt-launcher"),
-			Entry("10 or above verbosity", "virt-api: log verbosity must be 0-9", "--virt-api=10"),
+			Entry("11 or above verbosity", "virt-api: log verbosity must be 0-9", "--virt-api=11"),
 			Entry("one valid verbosity, one invalid verbosity", "virt-handler: log verbosity must be 0-9", "--virt-api=5", "--virt-handler=20"),
 		)
 	})
 
 	When("no logVerbosity field in the KubeVirt CR", func() {
-		DescribeTable("show operation", func(output []int, args ...string) {
+		BeforeEach(func() {
+			kvInterface.EXPECT().List(gomock.Any()).Return(kvs, nil).AnyTimes()
+			kvInterface.EXPECT().Get(kvs.Items[0].Name, gomock.Any()).Return(&kvs.Items[0], nil).AnyTimes()
+		})
+
+		DescribeTable("show operation", func(output []uint, args ...string) {
 			// should show the logVerbosity for components from the KubeVirt CR
 			// should show the unattended verbosity, so fill them with default verbosity (2)
 			commandAndArgs := []string{"adm", "log-verbosity"}
@@ -130,11 +246,24 @@ var _ = Describe("Log Verbosity", func() {
 			message := createOutputMessage(output) // create an expected output message
 			Expect(string(bytes)).To(ContainSubstring(*message))
 		},
-			Entry("all components", []int{2, 2, 2, 2, 2}, "--all"),
-			Entry("one component (1st component (i.e. virt-api))", []int{2, -1, -1, -1, -1}, "--virt-api"),
-			Entry("one component (last component (i.e. virt-operator))", []int{-1, -1, -1, -1, 2}, "--virt-operator"),
-			Entry("two components", []int{-1, 2, 2, -1, -1}, "--virt-controller", "--virt-handler"),
-			Entry("all + one component", []int{2, 2, 2, 2, 2}, "--all", "--virt-launcher"),
+			Entry("all components", []uint{2, 2, 2, 2, 2}, "--all"),
+			Entry(
+				"one component (1st component (i.e. virt-api))",
+				[]uint{2, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag},
+				"--virt-api",
+			),
+			Entry(
+				"one component (last component (i.e. virt-operator))",
+				[]uint{logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, 2},
+				"--virt-operator",
+			),
+			Entry(
+				"two components",
+				[]uint{logverbosity.NoFlag, 2, 2, logverbosity.NoFlag, logverbosity.NoFlag},
+				"--virt-controller",
+				"--virt-handler",
+			),
+			Entry("all + one component", []uint{2, 2, 2, 2, 2}, "--all", "--virt-launcher"),
 		)
 
 		Describe("set operation", func() {
@@ -161,6 +290,8 @@ var _ = Describe("Log Verbosity", func() {
 				Entry("two components", []uint{0, 3, 4, 0, 0}, "--virt-controller=3", "--virt-handler=4"),
 				Entry("other two components", []uint{0, 0, 0, 5, 6}, "--virt-launcher=5", "--virt-operator=6"),
 				Entry("all components", []uint{7, 7, 7, 7, 7}, "--all=7"),
+				// corner case
+				Entry("same component different verbosity (last one is a winner)", []uint{4, 0, 0, 0, 0}, "--virt-api=3", "--virt-api=4"),
 			)
 		})
 	})
@@ -174,9 +305,12 @@ var _ = Describe("Log Verbosity", func() {
 				VirtOperator:   4,
 			}
 			kv.Spec.Configuration.DeveloperConfiguration.LogVerbosity = lv
+
+			kvInterface.EXPECT().List(gomock.Any()).Return(kvs, nil).AnyTimes()
+			kvInterface.EXPECT().Get(kvs.Items[0].Name, gomock.Any()).Return(&kvs.Items[0], nil).AnyTimes()
 		})
 
-		DescribeTable("show operation", func(output []int, args ...string) {
+		DescribeTable("show operation", func(output []uint, args ...string) {
 			// should show the logVerbosity for components from the KubeVirt CR
 			// get and show the attended verbosity
 			// show the default verbosity (2), when the logVerbosity is unattended
@@ -188,12 +322,25 @@ var _ = Describe("Log Verbosity", func() {
 			message := createOutputMessage(output)
 			Expect(string(bytes)).To(ContainSubstring(*message))
 		},
-			Entry("all components", []int{5, 6, 2, 3, 4}, "--all"),
-			Entry("one component attended verbosity", []int{5, -1, -1, -1, -1}, "--virt-api"),
-			Entry("one component unattended verbosity", []int{-1, -1, 2, -1, -1}, "--virt-handler"),
-			Entry("two components with one unattended verbosity", []int{-1, 6, 2, -1, -1}, "--virt-handler", "--virt-controller"),
+			Entry("all components", []uint{5, 6, 2, 3, 4}, "--all"),
+			Entry(
+				"one component attended verbosity",
+				[]uint{5, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag},
+				"--virt-api",
+			),
+			Entry(
+				"one component unattended verbosity",
+				[]uint{logverbosity.NoFlag, logverbosity.NoFlag, 2, logverbosity.NoFlag, logverbosity.NoFlag},
+				"--virt-handler",
+			),
+			Entry(
+				"two components with one unattended verbosity",
+				[]uint{logverbosity.NoFlag, 6, 2, logverbosity.NoFlag, logverbosity.NoFlag},
+				"--virt-handler",
+				"--virt-controller",
+			),
 			// corner case
-			Entry("all components with default argument (equals show operation)", []int{5, 6, 2, 3, 4}, "--all=18446744073709551615"),
+			Entry("all components with default argument (equals show operation)", []uint{5, 6, 2, 3, 4}, "--all=10"),
 		)
 
 		Describe("set operation", func() {
@@ -216,6 +363,7 @@ var _ = Describe("Log Verbosity", func() {
 				Entry("reset and then set two components", []uint{0, 0, 1, 2, 0}, "--reset", "--virt-handler=1", "--virt-launcher=2"),
 				// corner case
 				Entry("two same operations (come down to one operation)", []uint{3, 6, 0, 3, 4}, "--virt-api=3", "--virt-api=3"),
+				Entry("same component different verbosity (last one is a winner)", []uint{4, 6, 0, 3, 4}, "--virt-api=3", "--virt-api=4"),
 			)
 		})
 	})
@@ -230,26 +378,18 @@ func expectAllComponentVerbosity(kv *v1.KubeVirt, output []uint) {
 }
 
 // create an expected output message
-func createOutputMessage(output []int) *string {
-	// mapping table from virtComponent to name of virt component
-	var componentToName = [virtComponentNum - 1]string{
-		"virt-api",
-		"virt-controller",
-		"virt-handler",
-		"virt-launcher",
-		"virt-operator",
-	}
-
+func createOutputMessage(output []uint) *string {
 	var message string
-	var component virtComponent
-	for component = virtAPI; component < all; component++ {
-		if output[int(component)] == -1 {
+	for component := logverbosity.VirtAPI; component < logverbosity.All; component++ {
+		if output[int(component)] == logverbosity.NoFlag {
 			continue
 		}
-		// output format is like:
-		// virt-api=1
-		// virt-controller=2
-		message += fmt.Sprintf("%s=%d\n", componentToName[component], uint(output[int(component)]))
+		// output format is [componentName]=[verbosity] like:
+		// 		virt-api=1
+		// 		virt-controller=2
+		componentName := logverbosity.GetComponentNameByVirtComponent(component)
+		verbosity := output[int(component)]
+		message += fmt.Sprintf("%s=%d\n", componentName, verbosity)
 	}
 	return &message
 }

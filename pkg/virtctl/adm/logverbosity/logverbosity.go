@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
 
 	"github.com/spf13/cobra"
@@ -28,8 +27,12 @@ type Command struct {
 
 const (
 	// for command parsing
-	noFlag = math.MaxUint - 1 // Default value if no flag is specified (dummy, we use cmd.Flags().Changed() to check if a flag is specified)
-	noArg  = math.MaxUint     // Default value if no argument specified (e.g. "--virt-api" = "--virt-api=18446744073709551615")
+	// try to use less weird numbers, because these numbers will be shown in the help menu
+	// there is no option to hide the default value from the help menu
+	// this is the behavior we inherit from pflag.FlagUsages, which calls the FlagUsagesWrapped function:
+	// https://github.com/kubevirt/kubevirt/blob/main/vendor/github.com/spf13/pflag/flag.go#L677
+	NoFlag = 100 // Default value if no flag is specified (dummy, we use cmd.Flags().Changed() to check if a flag is specified)
+	noArg  = 10  // Default value if no argument specified (e.g. "--virt-api" = "--virt-api=10")
 	// verbosity must be 0-9
 	// https://kubernetes.io/docs/reference/kubectl/cheatsheet/#kubectl-output-verbosity-and-debugging
 	minVerbosity = uint(0)
@@ -41,19 +44,21 @@ const (
 // TODO: set verbosity per nodes
 type virtComponent int
 
+// also used by the test file
 const (
-	virtAPI virtComponent = iota // virtAPI must be at the first position because it is used for the iteration
-	virtController
-	virtHandler
-	virtLauncher
-	virtOperator
-	all // all must be at the end, because it is used for the iteration
+	VirtAPI virtComponent = iota // virtAPI must be at the first position because it is used for the iteration
+	VirtController
+	VirtHandler
+	VirtLauncher
+	VirtOperator
+	All // all must be at the end, because it is used for the iteration
 )
 
-const virtComponentNum = int(all) + 1 // number of virt components
+// also used by the test file
+const VirtComponentNum = int(All) + 1 // number of virt components
 
 // for receiving the flag argument
-var verbosities [virtComponentNum]uint
+var verbosities [VirtComponentNum]uint
 var isReset bool
 
 // operation type of log-verbosity command
@@ -94,24 +99,24 @@ func NewCommand(clientConfig clientcmd.ClientConfig) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().UintVar(&verbosities[virtAPI], "virt-api", noFlag, "show/set virt-api log verbosity (0-9)")
+	cmd.Flags().UintVar(&verbosities[VirtAPI], "virt-api", NoFlag, "show/set virt-api log verbosity (0-9)")
 	// Set the default value if the flag has no argument, because we use the flag without an argument (e.g. --virt-api) to show verbosity.
 	// Otherwise, the pflag package will return an error due to missing argument.
 	cmd.Flags().Lookup("virt-api").NoOptDefVal = strconv.FormatUint(noArg, 10)
 
-	cmd.Flags().UintVar(&verbosities[virtController], "virt-controller", noFlag, "show/set virt-controller log verbosity (0-9)")
+	cmd.Flags().UintVar(&verbosities[VirtController], "virt-controller", NoFlag, "show/set virt-controller log verbosity (0-9)")
 	cmd.Flags().Lookup("virt-controller").NoOptDefVal = strconv.FormatUint(noArg, 10)
 
-	cmd.Flags().UintVar(&verbosities[virtHandler], "virt-handler", noFlag, "show/set virt-handler log verbosity (0-9)")
+	cmd.Flags().UintVar(&verbosities[VirtHandler], "virt-handler", NoFlag, "show/set virt-handler log verbosity (0-9)")
 	cmd.Flags().Lookup("virt-handler").NoOptDefVal = strconv.FormatUint(noArg, 10)
 
-	cmd.Flags().UintVar(&verbosities[virtLauncher], "virt-launcher", noFlag, "show/set virt-launcher log verbosity (0-9)")
+	cmd.Flags().UintVar(&verbosities[VirtLauncher], "virt-launcher", NoFlag, "show/set virt-launcher log verbosity (0-9)")
 	cmd.Flags().Lookup("virt-launcher").NoOptDefVal = strconv.FormatUint(noArg, 10)
 
-	cmd.Flags().UintVar(&verbosities[virtOperator], "virt-operator", noFlag, "show/set virt-operator log verbosity (0-9)")
+	cmd.Flags().UintVar(&verbosities[VirtOperator], "virt-operator", NoFlag, "show/set virt-operator log verbosity (0-9)")
 	cmd.Flags().Lookup("virt-operator").NoOptDefVal = strconv.FormatUint(noArg, 10)
 
-	cmd.Flags().UintVar(&verbosities[all], "all", noFlag, "show/set all component log verbosity (0-9)")
+	cmd.Flags().UintVar(&verbosities[All], "all", NoFlag, "show/set all component log verbosity (0-9)")
 	cmd.Flags().Lookup("all").NoOptDefVal = strconv.FormatUint(noArg, 10)
 
 	cmd.Flags().BoolVar(&isReset, "reset", false, "reset log verbosity to the default verbosity (2) (empty the log verbosity)")
@@ -161,15 +166,16 @@ func usage() string {
 	return usage
 }
 
-// virtComponent to component name
-func getComponentNameByVirtComponent(component virtComponent) string {
+// VirtComponent to component name
+// also used by the test file
+func GetComponentNameByVirtComponent(component virtComponent) string {
 	var virtComponentToComponentName = map[virtComponent]string{
-		virtAPI:        "virt-api",
-		virtController: "virt-controller",
-		virtHandler:    "virt-handler",
-		virtLauncher:   "virt-launcher",
-		virtOperator:   "virt-operator",
-		all:            "all",
+		VirtAPI:        "virt-api",
+		VirtController: "virt-controller",
+		VirtHandler:    "virt-handler",
+		VirtLauncher:   "virt-launcher",
+		VirtOperator:   "virt-operator",
+		All:            "all",
 	}
 	return virtComponentToComponentName[component]
 }
@@ -177,12 +183,12 @@ func getComponentNameByVirtComponent(component virtComponent) string {
 // virtComponent to JSON name
 func getJSONNameByVirtComponent(component virtComponent) string {
 	var virtComponentToJSONName = map[virtComponent]string{
-		virtAPI:        "virtAPI",
-		virtController: "virtController",
-		virtHandler:    "virtHandler",
-		virtLauncher:   "virtLauncher",
-		virtOperator:   "virtOperator",
-		all:            "all",
+		VirtAPI:        "virtAPI",
+		VirtController: "virtController",
+		VirtHandler:    "virtHandler",
+		VirtLauncher:   "virtLauncher",
+		VirtOperator:   "virtOperator",
+		All:            "all",
 	}
 	return virtComponentToJSONName[component]
 }
@@ -237,8 +243,8 @@ func createOutputLines(verbosityVal map[string]uint, options map[string]uint) []
 	if _, exist := options["all"]; exist {
 		allIsSet = true
 	}
-	for component := virtAPI; component < all; component++ { // all is the last component, and do not need to check it
-		componentName := getComponentNameByVirtComponent(component)
+	for component := VirtAPI; component < All; component++ { // all is the last component, and do not need to check it
+		componentName := GetComponentNameByVirtComponent(component)
 		JSONName := getJSONNameByVirtComponent(component)
 		if _, exist := options[componentName]; exist || allIsSet {
 			line := fmt.Sprintf("%s=%d", componentName, verbosityVal[JSONName])
@@ -281,7 +287,7 @@ func addPatch(patchData *[]patch.PatchOperation, currentLv map[string]uint) {
 func setVerbosity(currentLv, options map[string]uint, patchData *[]patch.PatchOperation) {
 	// update currentLv based on the user-specified verbosity for all components
 	if verbosity, exist := options["all"]; exist {
-		for component := virtAPI; component < all; component++ {
+		for component := VirtAPI; component < All; component++ {
 			JSONName := getJSONNameByVirtComponent(component)
 			currentLv[JSONName] = verbosity
 		}
@@ -322,8 +328,8 @@ func createPatch(currentLv, options map[string]uint) ([]byte, error) {
 func findOperation(cmd *cobra.Command, options map[string]uint) (operation, error) {
 	isShow, isSet := false, false
 
-	for component := virtAPI; component <= all; component++ {
-		componentName := getComponentNameByVirtComponent(component)
+	for component := VirtAPI; component <= All; component++ {
+		componentName := GetComponentNameByVirtComponent(component)
 
 		// check if the flag for the component is specified
 		if !cmd.Flags().Changed(componentName) {
@@ -355,7 +361,7 @@ func findOperation(cmd *cobra.Command, options map[string]uint) (operation, erro
 	}
 
 	if isShow && isSet {
-		return nop, fmt.Errorf("only show or set is allowed")
+		return nop, errors.New("only show or set is allowed")
 	}
 
 	if isShow {
