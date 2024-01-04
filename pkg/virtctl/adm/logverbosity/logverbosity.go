@@ -1,6 +1,7 @@
 package logverbosity
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,12 +22,16 @@ import (
 	"kubevirt.io/kubevirt/pkg/virtctl/templates"
 )
 
+var virtClient kubecli.KubevirtClient
+
 type Command struct {
 	clientConfig clientcmd.ClientConfig
 	command      string
 }
 
-// for command parsing
+// constants and variables for command parsing
+// for the details of the log verbosity,
+// see https://kubevirt.io/user-guide/operations/debug/#debug
 const (
 	// Verbosity must be 0-9.
 	// https://kubernetes.io/docs/reference/kubectl/cheatsheet/#kubectl-output-verbosity-and-debugging
@@ -42,12 +47,11 @@ const (
 	allComponents = "all" // Use in multiple places, so make it a constant
 )
 
-// for receiving the flag argument
-var isReset bool
+var (
+	isReset    bool
+	isResetVmi bool
+)
 
-// Log verbosity can be set per KubeVirt component.
-// https://kubevirt.io/user-guide/operations/debug/#setting-verbosity-per-kubevirt-component
-// TODO: set verbosity per nodes
 var virtComponents = map[string]*uint{
 	"virt-api":        new(uint),
 	"virt-controller": new(uint),
@@ -55,7 +59,10 @@ var virtComponents = map[string]*uint{
 	"virt-launcher":   new(uint),
 	"virt-operator":   new(uint),
 	allComponents:     new(uint),
+	"vmi":             new(uint),
 }
+
+var vmiName string
 
 // operation type of log-verbosity command
 type operation int
@@ -66,13 +73,15 @@ const (
 	nop
 )
 
-// for patch operation
+// constants for patch operation
+// for the details of the patch,
+// see https://www.rfc-editor.org/rfc/rfc6902
 const (
-	// Just "add" is fine, no need of "replace" and "remove".
-	// https://www.rfc-editor.org/rfc/rfc6902
-	patchAdd = patch.PatchAddOp
-	dcPath   = "/spec/configuration/developerConfiguration"
-	lvPath   = "/spec/configuration/developerConfiguration/logVerbosity"
+	patchAdd    = patch.PatchAddOp
+	patchRemove = patch.PatchRemoveOp
+	dcPath      = "/spec/configuration/developerConfiguration"
+	lvPath      = "/spec/configuration/developerConfiguration/logVerbosity"
+	labelPath   = "/spec/template/metadata/labels/logVerbosity"
 )
 
 func NewCommand(clientConfig clientcmd.ClientConfig) *cobra.Command {
@@ -125,6 +134,13 @@ func NewCommand(clientConfig clientcmd.ClientConfig) *cobra.Command {
 
 	cmd.Flags().BoolVar(&isReset, "reset", false, "reset log verbosity to the default verbosity (2) (empty the log verbosity)")
 
+	cmd.Flags().UintVar(virtComponents["vmi"], "vmi", NoFlag, "show/set vmi log verbosity (0-9)")
+	cmd.Flags().Lookup("vmi").NoOptDefVal = strconv.FormatUint(noArg, 10)
+
+	cmd.Flags().StringVar(&vmiName, "name", "", "vmi name")
+
+	cmd.Flags().BoolVar(&isResetVmi, "reset-vmi", false, "reset vmi log verbosity to the virt-launcher verbosity")
+
 	// cannot specify "reset" and "all" flag at the same time
 	cmd.MarkFlagsMutuallyExclusive("reset", allComponents)
 
@@ -175,11 +191,12 @@ func getJSONNameByComponentName(componentName string) string {
 		"virt-launcher":   "virtLauncher",
 		"virt-operator":   "virtOperator",
 		allComponents:     allComponents,
+		"vmi":             "vmi",
 	}
 	return componentNameToJSONName[componentName]
 }
 
-func detectInstallNamespaceAndName(virtClient kubecli.KubevirtClient) (string, string, error) {
+func detectInstallNamespaceAndName() (string, string, error) {
 	kvs, err := virtClient.KubeVirt(k8smetav1.NamespaceAll).List(&k8smetav1.ListOptions{})
 	if err != nil {
 		return "", "", fmt.Errorf("could not list KubeVirt CRs across all namespaces: %v", err)
@@ -229,6 +246,10 @@ func createOutputLines(verbosityVal map[string]uint) []string {
 		}
 		JSONName := getJSONNameByComponentName(componentName)
 		if *verbosity != NoFlag || allIsSet {
+			// all is only applied for the components, but vmi
+			if componentName == "vmi" && *verbosity == NoFlag && allIsSet {
+				continue
+			}
 			line := fmt.Sprintf("%s=%d", componentName, verbosityVal[JSONName])
 			lines = append(lines, line)
 		}
@@ -249,9 +270,10 @@ func createShowMessage(currentLv map[string]uint) []string {
 		"virtHandler":    virtconfig.DefaultVirtHandlerLogVerbosity,
 		"virtLauncher":   virtconfig.DefaultVirtLauncherLogVerbosity,
 		"virtOperator":   virtconfig.DefaultVirtOperatorLogVerbosity,
+		"vmi":            virtconfig.DefaultVirtLauncherLogVerbosity,
 	}
 
-	// update the verbosity based on the existing verbosity in the KubeVirt CR
+	// update the verbosity based on the existing verbosity in the KubeVirt CR and the logVerbosity label of VMI
 	for key, value := range currentLv {
 		verbosityVal[key] = value
 	}
@@ -273,7 +295,7 @@ func setVerbosity(currentLv map[string]uint, patchData *[]patch.PatchOperation, 
 	// update currentLv based on the user-specified verbosity for all components
 	if *virtComponents[allComponents] != NoFlag {
 		for componentName := range virtComponents {
-			if componentName == allComponents {
+			if componentName == allComponents || componentName == "vmi" {
 				continue
 			}
 			JSONName := getJSONNameByComponentName(componentName)
@@ -283,7 +305,7 @@ func setVerbosity(currentLv map[string]uint, patchData *[]patch.PatchOperation, 
 
 	// update currentLv based on the user-specified verbosity for each component
 	for componentName, verbosity := range virtComponents {
-		if componentName == allComponents || *verbosity == NoFlag {
+		if componentName == allComponents || *verbosity == NoFlag || componentName == "vmi" {
 			continue
 		}
 		JSONName := getJSONNameByComponentName(componentName)
@@ -300,7 +322,7 @@ func setVerbosity(currentLv map[string]uint, patchData *[]patch.PatchOperation, 
 	}
 }
 
-func createPatch(currentLv map[string]uint, hasDeveloperConfiguration bool) ([]byte, error) {
+func createKvPatch(currentLv map[string]uint, hasDeveloperConfiguration bool) ([]byte, error) {
 	patchData := []patch.PatchOperation{}
 
 	// reset only if verbosity exists, otherwise do nothing
@@ -344,7 +366,7 @@ func findOperation(cmd *cobra.Command) (operation, error) {
 	}
 
 	// do not distinguish between set and reset at this point, because set and reset can coexist
-	if isReset {
+	if isReset || isResetVmi {
 		isSet = true
 	}
 
@@ -360,18 +382,107 @@ func findOperation(cmd *cobra.Command) (operation, error) {
 	}
 }
 
+func getVmiVerbosity(currentLv map[string]uint, vm *v1.VirtualMachine, vmNamespace string) error {
+	if *vm.Spec.Running {
+		// check pod object's environmental variable VIRT_LAUNCHER_LOG_VERBOSITY
+		podList, err := virtClient.CoreV1().Pods(vmNamespace).List(context.Background(), k8smetav1.ListOptions{})
+		if err != nil {
+			return err
+		}
+		for _, pod := range podList.Items {
+			if pod.GenerateName != "virt-launcher-"+vmiName+"-" {
+				continue
+			}
+			for _, container := range pod.Spec.Containers {
+				if container.Name != "compute" {
+					continue
+				}
+				for _, env := range container.Env {
+					if env.Name == "VIRT_LAUNCHER_LOG_VERBOSITY" {
+						currentLv["vmi"], err = atou(env.Value)
+						if err != nil {
+							return err
+						}
+						break
+					}
+					// if there is no VIRT_LAUNCHER_LOG_VERBOSITY, the virt-launcher verbosity was set as default
+				}
+			}
+		}
+	} else {
+		if verbosity, exist := vm.Spec.Template.ObjectMeta.Labels["logVerbosity"]; exist {
+			var err error
+			// if label is specified, use the label in the vm object
+			currentLv["vmi"], err = atou(verbosity)
+			if err != nil {
+				return err
+			}
+		} else if val, exist := currentLv["virtLauncher"]; exist {
+			// if label is not specified, use the virt-launcher log verbosity
+			currentLv["vmi"] = val
+		}
+	}
+	return nil
+}
+
+func atou(s string) (uint, error) {
+	val, err := strconv.Atoi(s)
+	if err != nil {
+		return uint(val), fmt.Errorf("verbosity %s cannot cast to int: %v", s, err)
+	}
+	return uint(val), err
+}
+
+func createVmiPatch(cmd *cobra.Command, vm *v1.VirtualMachine) ([]byte, error) {
+	patchData := []patch.PatchOperation{}
+	if isResetVmi {
+		if _, exist := vm.Spec.Template.ObjectMeta.Labels["logVerbosity"]; exist {
+			patchData = append(patchData, patch.PatchOperation{
+				Op:   patchRemove,
+				Path: labelPath,
+			})
+		}
+	}
+	if cmd.Flags().Changed("vmi") {
+		if vm.Spec.Template.ObjectMeta.Labels == nil || len(vm.Spec.Template.ObjectMeta.Labels) == 0 {
+			// if vm.Spec.Template.ObjectMeta.Labels == map[string]string{}, add patch operation returns an error
+			// (missing path: "/spec/template/metadata/labels/logVerbosity": missing value)
+			addPatch(&patchData, patchAdd, "/spec/template/metadata/labels", map[string]string{"logVerbosity": ""})
+		}
+		verbosity := strconv.Itoa(int(*virtComponents["vmi"]))
+		addPatch(&patchData, patchAdd, labelPath, verbosity)
+	}
+	return json.Marshal(patchData)
+}
+
 func (c *Command) RunE(cmd *cobra.Command) error {
-	virtClient, err := kubecli.GetKubevirtClientFromClientConfig(c.clientConfig)
+	var err error
+	var vm *v1.VirtualMachine
+	var vmNamespace string
+
+	virtClient, err = kubecli.GetKubevirtClientFromClientConfig(c.clientConfig)
 	if err != nil {
 		return err
 	}
-	namespace, name, err := detectInstallNamespaceAndName(virtClient)
+
+	kvNamespace, kvName, err := detectInstallNamespaceAndName()
 	if err != nil {
 		return err
 	}
-	kv, err := virtClient.KubeVirt(namespace).Get(name, &k8smetav1.GetOptions{})
+	kv, err := virtClient.KubeVirt(kvNamespace).Get(kvName, &k8smetav1.GetOptions{})
 	if err != nil {
 		return err
+	}
+
+	if cmd.Flags().Changed("vmi") || isResetVmi {
+		vmNamespace, _, err = c.clientConfig.Namespace()
+		if err != nil {
+			return err
+		}
+		vm, err = virtClient.VirtualMachine(vmNamespace).Get(context.Background(), vmiName, &k8smetav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("error fetching Virtual Machine: %v", err)
+		}
 	}
 
 	// check the operation type (nop/show/set)
@@ -392,11 +503,18 @@ func (c *Command) RunE(cmd *cobra.Command) error {
 		if err != nil {
 			return err
 		}
+
+		// if vmi flag is specified, put the verbosity of vmi in curretnLv
+		if cmd.Flags().Changed("vmi") {
+			getVmiVerbosity(currentLv, vm, vmNamespace)
+		}
+
 		lines := createShowMessage(currentLv)
 		for _, line := range lines {
 			cmd.Println(line)
 		}
 	case set: // set and/or reset
+		// patch KubeVirt CR
 		// "Add" patch removes the value if we do not specify the value, even if we do not change the existing value.
 		// So, we need to get the existing verbosity in the KubeVirt CR.
 		// Also, "Add" patch needs a DeveloperConfiguration entry before adding a LogVerbosity entry.
@@ -405,14 +523,27 @@ func (c *Command) RunE(cmd *cobra.Command) error {
 		if err != nil {
 			return err
 		}
-		patchData, err := createPatch(currentLv, hasDeveloperConfiguration)
+		patchData, err := createKvPatch(currentLv, hasDeveloperConfiguration)
 		if err != nil {
 			return err
 		}
-		_, err = virtClient.KubeVirt(namespace).Patch(name, types.JSONPatchType, patchData, &k8smetav1.PatchOptions{})
+		_, err = virtClient.KubeVirt(kvNamespace).Patch(kvName, types.JSONPatchType, patchData, &k8smetav1.PatchOptions{})
 		if err != nil {
 			return err
 		}
+
+		// patch VM object
+		if cmd.Flags().Changed("vmi") || isResetVmi {
+			patchData, err = createVmiPatch(cmd, vm)
+			if err != nil {
+				return err
+			}
+			_, err = virtClient.VirtualMachine(vmNamespace).Patch(context.Background(), vmiName, types.JSONPatchType, patchData, &k8smetav1.PatchOptions{})
+			if err != nil {
+				return err
+			}
+		}
+
 		cmd.Println("successfully set/reset the log verbosity")
 	default:
 		return fmt.Errorf("op: an unknown operation: %v", op)

@@ -1,6 +1,7 @@
 package logverbosity_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,12 +11,16 @@ import (
 	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/testing"
 
 	"kubevirt.io/kubevirt/tests/clientcmd"
 
+	"k8s.io/client-go/kubernetes/fake"
 	"kubevirt.io/client-go/kubecli"
 
+	corev1 "k8s.io/api/core/v1"
 	k8smetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "kubevirt.io/api/core/v1"
 
@@ -32,6 +37,19 @@ var _ = Describe("Log Verbosity", func() {
 		installNamespace = "kubevirt"
 		installName      = "kubevirt"
 	)
+
+	// for vmi level verbosity
+	const (
+		vmiName                  = "testvm"
+		vmiNamespace             = "default"
+		virtLauncherPodName      = "virt-launcher-testvm-"
+		dummyVirtLauncherPodName = "virt-launcher-dummy-"
+		provisionerPodName       = "local-volume-provisioner-"
+	)
+
+	var vm *v1.VirtualMachine
+	var kubeClient *fake.Clientset
+	var vmInterface *kubecli.MockVirtualMachineInterface
 
 	commonShowDescribeTable := func() {
 		DescribeTable("show operation", commonShowTest,
@@ -105,6 +123,14 @@ var _ = Describe("Log Verbosity", func() {
 				Expect(err).ToNot(HaveOccurred())
 				return kv, nil
 			}).AnyTimes()
+
+		// for vmi level verbosity
+		vmInterface = kubecli.NewMockVirtualMachineInterface(ctrl)
+		kubeClient = fake.NewSimpleClientset()
+
+		kubecli.MockKubevirtClientInstance.EXPECT().VirtualMachine(vmiNamespace).Return(vmInterface).AnyTimes()
+		kubecli.MockKubevirtClientInstance.EXPECT().CoreV1().Return(kubeClient.CoreV1()).AnyTimes()
+
 	})
 
 	When("with erroneous running environment", func() {
@@ -346,6 +372,232 @@ var _ = Describe("Log Verbosity", func() {
 		})
 	})
 
+	// for vmi level verbosity
+	When("with invalid set of flags and arguments for vmi", func() {
+		BeforeEach(func() {
+			commonSetup(kvInterface, kvs)
+
+			vm = newVMNoLabel(vmiName, vmiNamespace)
+
+			vmInterface.EXPECT().Get(context.Background(), vm.Name, gomock.Any()).Return(vm, nil).AnyTimes()
+		})
+
+		Context("Get function has an error", func() {
+			// when no name flag is specified or the specified name is different from the vmi name, Get function returns an error
+			expectGetError := func() {
+				vmInterface.EXPECT().Get(context.Background(), gomock.Any(), gomock.Any()).DoAndReturn(
+					func(_ any, name string, _ any) (*v1.VirtualMachine, error) {
+						Expect(name).NotTo(Equal(vm.Name))
+						return nil, errors.New("Get error")
+					}).AnyTimes()
+			}
+
+			DescribeTable("should fail", func(args ...string) {
+				expectGetError()
+				commandAndArgs := []string{"adm", "log-verbosity"}
+				commandAndArgs = append(commandAndArgs, args...)
+				cmd := clientcmd.NewRepeatableVirtctlCommand(commandAndArgs...)
+				err := cmd()
+				Expect(err).NotTo(Succeed())
+				Expect(err).To(MatchError(ContainSubstring("Get error")))
+			},
+				Entry("no name flag (show)", "--vmi"),
+				Entry("unknown name (show)", "--vmi", "--name=testvm1"),
+			)
+		})
+
+		DescribeTable("should fail handled by error handler", func(output string, args ...string) {
+			commandAndArgs := []string{"adm", "log-verbosity"}
+			commandAndArgs = append(commandAndArgs, args...)
+			_, err := clientcmd.NewRepeatableVirtctlCommandWithOut(commandAndArgs...)()
+			Expect(err).NotTo(Succeed())
+
+			Expect(err).To(MatchError(ContainSubstring(output)))
+		},
+			Entry("show and reset mix", "only show or set is allowed", "--reset-vmi", "--vmi", "--name=testvm"),
+			// coexistence of virt components and vmi
+
+		)
+
+	})
+
+	When("with virt-launcher=default and no label", func() {
+		BeforeEach(func() {
+			commonSetup(kvInterface, kvs)
+		})
+
+		Describe("only vmi related flags and args", func() {
+			BeforeEach(func() {
+				vm = newVMNoLabel(vmiName, vmiNamespace)
+
+				vmInterface.EXPECT().Get(context.Background(), vm.Name, gomock.Any()).Return(vm, nil).AnyTimes()
+
+				vmInterface.EXPECT().Patch(gomock.Any(), gomock.Any(), types.JSONPatchType, gomock.Any(), gomock.Any()).DoAndReturn(
+					func(_ any, name string, _ any, patchData []byte, _ any, _ ...any) (*v1.VirtualMachine, error) {
+						Expect(name).To(Equal(vmiName))
+
+						patch, err := jsonpatch.DecodePatch(patchData)
+						Expect(err).ToNot(HaveOccurred())
+						kvJSON, err := json.Marshal(vm)
+						Expect(err).ToNot(HaveOccurred())
+						modifiedKvJSON, err := patch.Apply(kvJSON)
+						Expect(err).ToNot(HaveOccurred())
+
+						// reset the object in preparation for unmarshal,
+						// since unmarshal does not guarantee that fields in vm will be removed by the patch
+						vm = &v1.VirtualMachine{}
+
+						err = json.Unmarshal(modifiedKvJSON, vm)
+						Expect(err).ToNot(HaveOccurred())
+						return vm, nil
+					}).AnyTimes()
+			})
+
+			restartVM := func(withVerbosity bool) {
+				running := true
+				vm.Spec.Running = &running
+
+				kubeClient.Fake.PrependReactor("list", "pods", func(action testing.Action) (bool, runtime.Object, error) {
+					var virtLauncherPod *corev1.Pod
+					if withVerbosity {
+						virtLauncherPod = newPodWithVerbosity(virtLauncherPodName, vmiNamespace, vm.Spec.Template.ObjectMeta.Labels["logVerbosity"])
+					} else {
+						virtLauncherPod = newPodNoVerbosity(virtLauncherPodName, vmiNamespace)
+					}
+					virtLauncerPodDummy := newPodNoVerbosity(dummyVirtLauncherPodName, vmiNamespace)
+					provisionerPod := newPodNoVerbosity(provisionerPodName, vmiNamespace)
+					pods := newPodList(*virtLauncherPod, *virtLauncerPodDummy, *provisionerPod)
+					return true, pods, nil
+				})
+			}
+
+			Context("vmi set", func() {
+				It("vmi=5 (show before setting label)", func() {
+					// show before setting label
+					// virt-launcher=empty (default), no label
+					args := []string{"--vmi", "--name=testvm"}
+					output := []uint{logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, 2}
+					commonShowTest(output, args...)
+
+					// set the logVerbosity label in the vm object
+					cmd := clientcmd.NewRepeatableVirtctlCommand("adm", "log-verbosity", "--vmi=5", "--name=testvm")
+					Expect(cmd()).To(Succeed())
+					Expect(vm.Spec.Template.ObjectMeta.Labels["logVerbosity"]).To(Equal("5"))
+
+					// show before starting VM
+					// since vm has not started yet, show vm object's label
+					args = []string{"--vmi", "--name=testvm"}
+					output = []uint{logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, 5}
+					commonShowTest(output, args...)
+
+					// to restart vm means to change vm object status Running and to launch pods
+					withVerbosity := true
+					restartVM(withVerbosity)
+
+					// show after starting VM
+					// show the pod's VIRT_LAUNCHER_LOG_VERBOSITY env variable
+					args = []string{"--vmi", "--name=testvm"}
+					output = []uint{logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, 5}
+					commonShowTest(output, args...)
+
+				})
+				/*
+					It("vmi=5 (show before setting label)", func() {
+						// virt-launcher=empty (default), no label
+						args := []string{"--vmi", "--name=testvm"}
+						output := []uint{logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, 2}
+						commonShowTest(output, args...)
+					})
+					It("vmi=5 (set label)", func() {
+						// add the logVerbosity label in the vm object
+						cmd := clientcmd.NewRepeatableVirtctlCommand("adm", "log-verbosity", "--vmi=5", "--name=testvm")
+						Expect(cmd()).To(Succeed())
+						Expect(vm.Spec.Template.ObjectMeta.Labels["logVerbosity"]).To(Equal("5"))
+					})
+					It("vmi=5 (show before restart vm)", func() {
+						// set logVerbosity label to 5
+						vm.Spec.Template.ObjectMeta.Labels["logVerbosity"] = "5"
+
+						// since vm has not started yet, show vm object's label
+						args := []string{"--vmi", "--name=testvm"}
+						output := []uint{logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, 5}
+						commonShowTest(output, args...)
+					})
+					It("vmi=5 (show after restart vm)", func() {
+						// set logVerbosity label to 5
+						vm.Spec.Template.ObjectMeta.Labels["logVerbosity"] = "5"
+
+						// to restart vm means to change vm object status Running and to launch pods
+						withVerbosity := true
+						restartVM(withVerbosity)
+
+						// show the pod's VIRT_LAUNCHER_LOG_VERBOSITY env variable
+						args := []string{"--vmi", "--name=testvm"}
+						output := []uint{logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, 5}
+						commonShowTest(output, args...)
+					})
+				*/
+			})
+
+			Context("vmi reset", func() {
+				It("vmi=5 (show before resetting label)", func() {
+					// set logVerbosity label to 5
+					vm.Spec.Template.ObjectMeta.Labels["logVerbosity"] = "5"
+
+					// since vm has not started yet, show vm object's label
+					args := []string{"--vmi", "--name=testvm"}
+					output := []uint{logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, 5}
+					commonShowTest(output, args...)
+				})
+				It("--reset-vmi", func() {
+					// reset (remove) the logVerbosity label in the vm object
+					cmd := clientcmd.NewRepeatableVirtctlCommand("adm", "log-verbosity", "--reset-vmi", "--name=testvm")
+					Expect(cmd()).To(Succeed())
+					_, exist := vm.Spec.Template.ObjectMeta.Labels["logVerbosity"]
+					Expect(exist).To(BeFalse())
+				})
+				It("vmi=5 (show before restart vm)", func() {
+					// set logVerbosity label to 5
+					vm.Spec.Template.ObjectMeta.Labels["logVerbosity"] = "5"
+
+					// since vm has not started yet, show vm object's label
+					args := []string{"--vmi", "--name=testvm"}
+					output := []uint{logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, 5}
+					commonShowTest(output, args...)
+				})
+				It("vmi=5 (show after restart vm)", func() {
+					// reset logVerbosity label
+					vm.Spec.Template.ObjectMeta.Labels = map[string]string{}
+
+					// to restart vm means to change vm object status Running and to launch pods
+					withVerbosity := false
+					restartVM(withVerbosity)
+
+					// show the pod's VIRT_LAUNCHER_LOG_VERBOSITY env variable
+					// virt-launcher=empty (default) and no label, then no VIRT_LAUNCHER_LOG_VERBOSITY env variable in the pod
+					// then the verbosity should be default
+					args := []string{"--vmi", "--name=testvm"}
+					output := []uint{logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, logverbosity.NoFlag, 2}
+					commonShowTest(output, args...)
+				})
+			})
+		})
+
+		Describe("coexistence of virt components and vmi", func() {
+
+			Context("one component (virt-api=3) and vmi=6", func() {
+
+			})
+
+			Context("one component (virt-launcher=3) and no label (reset-vmi)", func() {
+				It("", func() {
+
+				})
+			})
+
+		})
+	})
+
 })
 
 func expectAllComponentVerbosity(kv *v1.KubeVirt, output []uint) {
@@ -411,4 +663,103 @@ func commonSetCommand(args ...string) {
 	commandAndArgs = append(commandAndArgs, args...)
 	cmd := clientcmd.NewRepeatableVirtctlCommand(commandAndArgs...)
 	Expect(cmd()).To(Succeed())
+}
+
+// for vmi level verbosity
+func newVMNoLabel(name, namespace string) *v1.VirtualMachine {
+	return &v1.VirtualMachine{
+		TypeMeta: k8smetav1.TypeMeta{
+			APIVersion: v1.GroupVersion.String(),
+			Kind:       "VirtualMachine",
+		},
+		ObjectMeta: k8smetav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: v1.VirtualMachineSpec{
+			Running: new(bool),
+			Template: &v1.VirtualMachineInstanceTemplateSpec{
+				ObjectMeta: k8smetav1.ObjectMeta{
+					Labels: map[string]string{
+						//"kubevirt.io/domain": name,
+						//"kubevirt.io/size":   "small",
+					},
+				},
+			},
+		},
+	}
+}
+
+func newPodNoVerbosity(name, namespace string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: k8smetav1.ObjectMeta{
+			GenerateName: name,
+			Namespace:    namespace,
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name: "compute",
+					Env:  []corev1.EnvVar{},
+				},
+				{
+					Name: "volumecontainerdisk",
+				},
+				{
+					Name: "guest-console-log",
+				},
+			},
+		},
+	}
+}
+
+func newPodWithVerbosity(name, namespace, verbosity string) *corev1.Pod {
+	pod := newPodNoVerbosity(name, namespace)
+	containers := []corev1.Container{
+		{
+			Name: "compute",
+			Env: []corev1.EnvVar{
+				{
+					Name:  "VIRT_LAUNCHER_LOG_VERBOSITY",
+					Value: verbosity,
+				},
+			},
+		},
+		{
+			Name: "volumecontainerdisk",
+		},
+		{
+			Name: "guest-console-log",
+		},
+	}
+	pod.Spec.Containers = containers
+	return pod
+}
+
+func newPodList(pods ...corev1.Pod) *corev1.PodList {
+	return &corev1.PodList{
+		TypeMeta: k8smetav1.TypeMeta{
+			APIVersion: v1.GroupVersion.String(),
+			Kind:       "List",
+		},
+		Items: pods,
+	}
+}
+
+// create an expected output message
+func createOutputMessageVmi(output []uint) *string {
+	var message string
+	var components = []string{"virt-api", "virt-controller", "virt-handler", "virt-launcher", "virt-operator", "vmi"}
+	for component := 0; component < len(components); component++ {
+		if output[component] == logverbosity.NoFlag {
+			continue
+		}
+		// output format is [componentName]=[verbosity] like:
+		// 		virt-api=1
+		// 		virt-controller=2
+		componentName := components[component]
+		verbosity := output[component]
+		message += fmt.Sprintf("%s=%d\n", componentName, verbosity)
+	}
+	return &message
 }
